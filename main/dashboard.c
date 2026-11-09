@@ -5,7 +5,6 @@
 #include <string.h>
 #include "esp_log.h"
 #include "nvs.h"
-#include "usb_mode.h"
 #include "settings.h"
 #include "src/draw/lv_image_decoder_private.h"
 #ifdef ESP_PLATFORM
@@ -1108,12 +1107,6 @@ static void create_edit_bar(void)
 static void menu_theme_cb(lv_event_t *e);
 static void menu_reset_cb(lv_event_t *e);
 
-static void menu_usb_cb(lv_event_t *e)
-{
-    (void)e;
-    usb_mode_request();
-}
-
 static void menu_close(void)
 {
     if (s_menu) {
@@ -1248,11 +1241,7 @@ static void menu_open(void)
     lv_obj_set_style_text_font(sub2, &lv_font_montserrat_16, 0);
     lv_obj_set_style_pad_top(sub2, 12, 0);
     menu_row(list, "Mostrar nombres", s_show_names, names_switch_cb, NULL);
-
-    /* Modo USB: reinicia y deja la SD como pendrive para la compu */
-    lv_obj_t *usb_btn = create_button(list, "Modo USB (cargar dashboards)", 0x2A5DB0, menu_usb_cb);
-    lv_obj_set_width(usb_btn, LV_PCT(100));
-    lv_obj_set_style_margin_top(usb_btn, 8, 0);
+    /* Modo USB y restablecer de fabrica estan en el menu de configuracion (settings.c) */
 
     lv_obj_t *buttons = create_box(s_menu);
     lv_obj_set_size(buttons, LV_PCT(100), LV_SIZE_CONTENT);
