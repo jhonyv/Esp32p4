@@ -1,0 +1,18 @@
+{
+  "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\jhony\\Desktop\\ESP32-P4-WIFI6-Touch-LCD-7B-main\\ESP32-P4-WIFI6-Touch-LCD-7B-main\\examples\\esp-idf\\09_lvgl_demo_v9\\build"
+  ],
+  "idf.flashType": "UART",
+  "idf.portWin": "COM8",
+  "idf.port": "COM9"
+}
