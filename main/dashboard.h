@@ -93,6 +93,24 @@ typedef struct {
     bool hide_unit;
 } dash_element_t;
 
+/* Alarma de un sensor: fuera de [low, high] su valor se pone rojo y titila */
+typedef struct {
+    bool use_low, use_high;
+    float low, high;
+    float rpm_min;            /* solo avisa con las RPM por encima de esto (0 = siempre) */
+} dash_alarm_t;
+
+#define DASH_SHIFT_BORDER 0x01   /* shift light en el borde de la pantalla */
+#define DASH_SHIFT_BAR    0x02   /* la barra de RPM titila */
+
+/* Shift light: desde warn_rpm prende fijo (solo en el borde), desde flash_rpm titila */
+typedef struct {
+    float warn_rpm;           /* 0 = sin aviso fijo */
+    float flash_rpm;          /* 0 = sin shift light */
+    uint32_t color;
+    uint8_t mode;             /* DASH_SHIFT_BORDER | DASH_SHIFT_BAR */
+} dash_shift_t;
+
 typedef struct {
     const char *name;
     uint32_t bg_color;
@@ -101,6 +119,9 @@ typedef struct {
                                  lo acomodado en la pantalla se descarta y se usa lo nuevo */
     const dash_element_t *elements;
     size_t element_count;
+    dash_alarm_t alarms[SENSOR_COUNT];
+    bool alarm_border;        /* con una alarma, el borde de la pantalla titila en rojo */
+    dash_shift_t shift;
 } dash_theme_t;
 
 /* Arranca el dashboard con la lista de temas disponibles. Llamar con el lock de
