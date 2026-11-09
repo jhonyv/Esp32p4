@@ -87,6 +87,7 @@ static bool s_edit;
 static lv_obj_t *s_menu;
 static lv_obj_t *s_edit_bar;
 static dash_item_t *s_selected;     /* elemento elegido en modo edicion */
+static bool s_paused;               /* menu de ajustes abierto: no se refresca nada */
 
 /* Alarmas y shift light */
 static bool s_alarm[SENSOR_COUNT];
@@ -1324,6 +1325,9 @@ static void build(const dash_theme_t *theme)
 
     refresh_timer_cb(NULL);
     s_timer = lv_timer_create(refresh_timer_cb, DASH_REFRESH_MS, NULL);
+    if (s_paused) {
+        lv_timer_pause(s_timer);
+    }
     ESP_LOGI(TAG, "Dashboard '%s' creado con %u elementos", theme->name, (unsigned)s_item_count);
 }
 
@@ -1405,6 +1409,25 @@ static void menu_theme_cb(lv_event_t *e)
     save_theme_idx();
     /* el boton que llamo esto se borra al reconstruir: se hace despues del evento */
     lv_async_call(switch_theme_async, NULL);
+}
+
+void dashboard_menu_open(void)
+{
+    menu_open();
+}
+
+void dashboard_set_paused(bool paused)
+{
+    s_paused = paused;
+    if (!s_timer) {
+        return;
+    }
+    if (paused) {
+        lv_timer_pause(s_timer);
+    } else {
+        lv_timer_resume(s_timer);
+        lv_timer_ready(s_timer);    /* refresca ya, sin esperar el proximo ciclo */
+    }
 }
 
 void dashboard_start(const dash_theme_t *const *themes, size_t theme_count)

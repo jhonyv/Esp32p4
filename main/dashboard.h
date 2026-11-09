@@ -130,6 +130,14 @@ typedef struct {
  * menu de ajustes, desde donde tambien se cambia de tema. */
 void dashboard_start(const dash_theme_t *const *themes, size_t theme_count);
 
+/* Para el menu de ajustes a pantalla completa: con paused = true deja de refrescar
+ * valores, agujas, animaciones, alarmas y shift light (no gasta tiempo detras del menu).
+ * Llamar con el lock de LVGL tomado. */
+void dashboard_set_paused(bool paused);
+
+/* Abre el menu del dashboard (valores visibles, nombres, mover valores, temas) */
+void dashboard_menu_open(void);
+
 /* Lee una imagen (PNG/JPG) con los decodificadores de LVGL y devuelve una copia
  * propia en memoria, o NULL si no se pudo. Se libera con lv_draw_buf_destroy(). */
 lv_draw_buf_t *dash_image_load(const char *path);
