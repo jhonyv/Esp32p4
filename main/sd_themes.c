@@ -95,7 +95,8 @@ typedef struct {
     bool has_name[SENSOR_COUNT];    /* false = el nombre de fabrica */
     dash_alarm_t alarms[SENSOR_COUNT];  /* alarma_xxx=baja_de,sube_de[,rpm] */
     int alarm_border;               /* alarma_borde=1: el borde titila en rojo */
-    dash_shift_t shift;             /* shift_aviso / shift_rpm / shift_color / shift_modo */
+    dash_shift_t shift;             /* shift_aviso / shift_rpm / shift_color / shift_modo / shift_fps */
+    sd_place_t shift_img;           /* shift_imagen=x,y,tamano,visible (shift_00.png, ...) */
     sd_gauge_t gauges[MAX_GAUGES];
     sd_anim_t anims[MAX_ANIMS];
     uint32_t sig;                   /* firma del archivo: si cambia, manda la ubicacion nueva */
@@ -363,8 +364,27 @@ static void read_config(const char *dir, sd_config_t *cfg)
             continue;
         }
         if (!strcmp(k, "shift_modo")) {
-            cfg->shift.mode = !strcmp(v, "barra") ? DASH_SHIFT_BAR
-                            : !strcmp(v, "ambos") ? DASH_SHIFT_BORDER | DASH_SHIFT_BAR : DASH_SHIFT_BORDER;
+            /* borde, barra, ambos (borde y barra) o imagen; se pueden juntar: "imagen,borde" */
+            uint8_t m = 0;
+            if (strstr(v, "borde") || strstr(v, "ambos")) {
+                m |= DASH_SHIFT_BORDER;
+            }
+            if (strstr(v, "barra") || strstr(v, "ambos")) {
+                m |= DASH_SHIFT_BAR;
+            }
+            if (strstr(v, "imagen")) {
+                m |= DASH_SHIFT_IMAGE;
+            }
+            cfg->shift.mode = m ? m : DASH_SHIFT_BORDER;
+            continue;
+        }
+        if (!strcmp(k, "shift_fps")) {
+            int fps = atoi(v);
+            cfg->shift.fps = (uint8_t)(fps < 1 ? 1 : fps > 60 ? 60 : fps);
+            continue;
+        }
+        if (!strcmp(k, "shift_imagen")) {
+            parse_place(v, &cfg->shift_img);
             continue;
         }
         sensor_id_t name_id;
@@ -558,13 +578,15 @@ static dash_theme_t *build_theme(const char *name)
         anim_frames[a] = count_frames(dir, fmt, &anim_ext[a]);
         has_anim |= anim_frames[a] > 0;
     }
+    const char *shift_ext = NULL;
+    int shift_frames = count_frames(dir, "shift_%02d.%s", &shift_ext);
 
     if (!frames && !bg_file && !has_bar && !has_needle && !has_anim) {
         ESP_LOGW(TAG, "'%s': no tiene fondo, bar.png, relojes ni animaciones, se ignora", name);
         return NULL;
     }
 
-    dash_element_t *els = calloc(2 + MAX_ANIMS + 2 * MAX_GAUGES + SENSOR_COUNT, sizeof(dash_element_t));
+    dash_element_t *els = calloc(3 + MAX_ANIMS + 2 * MAX_GAUGES + SENSOR_COUNT, sizeof(dash_element_t));
     dash_theme_t *th = calloc(1, sizeof(dash_theme_t));
     if (!els || !th) {
         free(els);
@@ -720,6 +742,37 @@ static dash_theme_t *build_theme(const char *name)
         }
     }
 
+    /* 6. Imagen o GIF del shift light: arriba de todo (shift_00.png, shift_01.png, ...) */
+    bool shift_img = false;
+    if ((cfg.shift.mode & DASH_SHIFT_IMAGE) && shift_frames && cfg.shift.flash_rpm + cfg.shift.warn_rpm > 0) {
+        char *fmt = malloc(320);
+        if (fmt) {
+            snprintf(fmt, 320, SD_THEMES_LV_DIR "/%s/shift_%%02u.%s", name, shift_ext);
+            const sd_place_t *p = &cfg.shift_img;
+            int x = p->x, y = p->y;
+            if (!p->set) {
+                /* sin shift_imagen=: centrada */
+                char path[340];
+                lv_image_header_t hd;
+                snprintf(path, sizeof(path), fmt, 0u);
+                bool ok = lv_image_decoder_get_info(path, &hd) == LV_RESULT_OK;
+                x = ok && hd.w < 1024 ? (1024 - hd.w) / 2 : 0;
+                y = ok && hd.h < 600 ? (600 - hd.h) / 2 : 0;
+            }
+            els[n++] = (dash_element_t) {
+                .type = DASH_EL_FRAMES, .sensor = SENSOR_RPM, .movable = true, .caption = "Shift light",
+                .x = x, .y = y, .scale = p->set ? pct_to_scale(p->size_pct) : 0,
+                .hidden = p->set && !p->visible, .frame_path_fmt = fmt,
+                .frame_count = (uint8_t)shift_frames, .preload = true, .shift_light = true,
+                .min = cfg.rpm_min, .max = cfg.rpm_max,
+            };
+            shift_img = true;
+        }
+    } else if (cfg.shift.mode & DASH_SHIFT_IMAGE) {
+        ESP_LOGW(TAG, "'%s': shift_modo=imagen pero %s", name,
+                 shift_frames ? "falta shift_rpm o shift_aviso" : "faltan shift_00.png (o .jpg)");
+    }
+
     th->name = strdup(name);
     th->bg_color = 0x000000;
     th->show_names = cfg.nombres != 0;
@@ -734,8 +787,9 @@ static dash_theme_t *build_theme(const char *name)
         alarms += cfg.alarms[i].use_low || cfg.alarms[i].use_high;
     }
     if (alarms || cfg.shift.flash_rpm > 0) {
-        ESP_LOGI(TAG, "'%s': %d alarmas, shift light %s", name, alarms,
-                 cfg.shift.flash_rpm > 0 ? "si" : "no");
+        ESP_LOGI(TAG, "'%s': %d alarmas, shift light %s%s", name, alarms,
+                 cfg.shift.flash_rpm > 0 ? "si" : "no",
+                 shift_img ? (shift_frames > 1 ? " (GIF)" : " (imagen)") : "");
     }
     ESP_LOGI(TAG, "'%s': %d cuadros de fondo, fondo fijo %s, barra %s, %d animaciones, %d relojes, fuente %s",
              name, frames, bg_file ? bg_file : "no", has_bar ? "si" : "no", anims, gauges,

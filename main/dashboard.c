@@ -54,7 +54,9 @@ typedef struct dash_item {
     int16_t dx0, dy0;           /* distancia al lider en el tema, sin escalar */
     uint16_t scale;             /* SCALE_100 = tamano original */
     int8_t alarm_state;         /* VALUE: 0 normal, 1 alarma (prendido), 2 alarma (tenue), -1 revisar */
-    bool shift_off;             /* BAR de RPM: relleno apagado por el shift light */
+    bool shift_off;             /* BAR de RPM: relleno apagado por el shift light.
+                                   FRAMES del shift light: imagen escondida */
+    uint32_t shift_since;       /* FRAMES del shift light: desde cuando titila (0 = no) */
 } dash_item_t;
 
 /* Lo que se guarda en NVS por cada tema */
@@ -562,7 +564,7 @@ static void create_item(lv_obj_t *scr, dash_item_t *it)
             preload_frames(it);
         }
         it->shown = sensors_get(el->sensor);
-        int32_t idx = frame_index(el, it->shown);
+        int32_t idx = el->shift_light ? 0 : frame_index(el, it->shown);
         if (it->frame_cache) {
             idx = it->frame_step > 1 ? idx - idx % it->frame_step : idx;
             lv_image_set_src(it->obj, cached_frame(it, idx));
@@ -572,6 +574,7 @@ static void create_item(lv_obj_t *scr, dash_item_t *it)
             lv_image_set_src(it->obj, el->frames[idx]);
         }
         it->last_number = idx;
+        it->shift_off = el->shift_light;    /* el shift light arranca escondido */
         break;
     }
     }
@@ -613,7 +616,7 @@ static void apply_settings(void)
 {
     for (size_t i = 0; i < s_item_count; i++) {
         dash_item_t *it = &s_items[i];
-        set_hidden(it->obj, it->el.hidden);
+        set_hidden(it->obj, it->el.hidden || (it->el.shift_light && it->shift_off));
         if (it->caption_label) {
             set_hidden(it->caption_label, !s_show_names || !caption_text(it)[0]);
         }
@@ -790,6 +793,52 @@ static void create_overlay(lv_obj_t *scr)
     set_hidden(s_banner, true);
 }
 
+/* Imagen o GIF del shift light: aparece desde shift_aviso (quieta, en su primer cuadro) y desde
+ * shift_rpm titila (una imagen) o se anima (GIF, desde el primer cuadro). En el modo edicion se
+ * ve siempre, para poder moverla. */
+static void shift_image_update(dash_item_t *it)
+{
+    const dash_element_t *el = &it->el;
+    const dash_shift_t *sh = &s_theme->shift;
+    float rpm = sensors_get(SENSOR_RPM);
+    bool flash = !s_edit && sh->flash_rpm > 0 && rpm >= sh->flash_rpm;
+    bool show = s_edit || flash || (sh->warn_rpm > 0 && rpm >= sh->warn_rpm);
+    int32_t idx = 0;
+    if (!flash) {
+        it->shift_since = 0;
+    } else {
+        if (!it->shift_since) {
+            it->shift_since = lv_tick_get() | 1;
+        }
+        uint32_t t = lv_tick_elaps(it->shift_since);
+        if (el->frame_count > 1) {
+            uint32_t fps = sh->fps ? sh->fps : 12;
+            idx = (int32_t)(((uint64_t)t * fps / 1000) % el->frame_count);
+        } else {
+            show = (t / SHIFT_BLINK_MS) % 2 == 0;
+        }
+    }
+    if (show == it->shift_off) {
+        it->shift_off = !show;
+        set_hidden(it->obj, it->shift_off);
+    }
+    if (!show) {
+        return;
+    }
+    if (it->frame_cache && it->frame_step > 1) {
+        idx -= idx % it->frame_step;
+    }
+    if (idx == it->last_number) {
+        return;
+    }
+    if (it->frame_cache) {
+        it->last_number = idx;
+        lv_image_set_src(it->obj, cached_frame(it, idx));
+    } else if (lv_tick_elaps(it->frame_tick) >= FRAME_MIN_MS && show_file_frame(it, idx)) {
+        it->last_number = idx;
+    }
+}
+
 static void update_item(dash_item_t *it)
 {
     const dash_element_t *el = &it->el;
@@ -886,6 +935,10 @@ static void update_item(dash_item_t *it)
     }
 
     case DASH_EL_FRAMES: {
+        if (el->shift_light) {
+            shift_image_update(it);
+            break;
+        }
         if (el->smoothing > 0) {
             it->shown += (v - it->shown) * el->smoothing;
             v = it->shown;

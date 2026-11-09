@@ -77,6 +77,8 @@ typedef struct {
     uint8_t range_count;                         /* 0 = todos parejo de min a max */
     bool preload;               /* desde archivo: leer todos los cuadros al abrir el tema,
                                    si entran en memoria (cambian al instante) */
+    bool shift_light;           /* imagen del shift light: no sigue al sensor, aparece con las
+                                   RPM del shift light del tema (ver dash_shift_t) */
 
     /* DASH_EL_DIGITS */
     const lv_image_dsc_t *const *digit_imgs;   /* 10 imagenes: 0..9 */
@@ -102,13 +104,16 @@ typedef struct {
 
 #define DASH_SHIFT_BORDER 0x01   /* shift light en el borde de la pantalla */
 #define DASH_SHIFT_BAR    0x02   /* la barra de RPM titila */
+#define DASH_SHIFT_IMAGE  0x04   /* una imagen o GIF (elemento FRAMES con shift_light) */
 
-/* Shift light: desde warn_rpm prende fijo (solo en el borde), desde flash_rpm titila */
+/* Shift light: desde warn_rpm prende fijo (borde, o la imagen quieta en su primer cuadro),
+ * desde flash_rpm titila (borde, barra, imagen) o se anima (GIF, a fps cuadros por segundo) */
 typedef struct {
     float warn_rpm;           /* 0 = sin aviso fijo */
     float flash_rpm;          /* 0 = sin shift light */
     uint32_t color;
-    uint8_t mode;             /* DASH_SHIFT_BORDER | DASH_SHIFT_BAR */
+    uint8_t mode;             /* DASH_SHIFT_BORDER | DASH_SHIFT_BAR | DASH_SHIFT_IMAGE */
+    uint8_t fps;              /* GIF del shift light: cuadros por segundo (0 = 12) */
 } dash_shift_t;
 
 typedef struct {
