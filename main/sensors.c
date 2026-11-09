@@ -5,12 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "nvs.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -18,9 +18,9 @@
 
 static const char *TAG = "sensors";
 
-#ifndef CONFIG_PATH
-#define CONFIG_PATH     "/sdcard/sensores.txt"
-#endif
+#define NVS_NS          "sensores"
+#define NVS_KEY         "cfg"
+#define SETUP_VERSION   1       /* subir si cambia sensor_setup_t */
 #define LOOP_MS         10      /* cada cuanto se recalculan los valores */
 #define ADC_SAMPLES     4       /* lecturas promediadas por vuelta */
 #define PULSE_AVG       4       /* periodos promediados para RPM / velocidad */
@@ -66,11 +66,12 @@ static const ntc_pt_t s_ntc_gm[] = {
     { 80, 332 }, { 90, 241 }, { 100, 177 }, { 110, 132 }, { 120, 100 },
 };
 
-/* Tipos de sensor que se eligen con tipo=... en sensores.txt.
- * Los lineales van de (v1, val1) a (v2, val2) en la unidad indicada; si el sensor
- * se muestra en otra unidad (por ejemplo bar en vez de psi) se convierte solo. */
+/* Tipos de sensor que se eligen en el menu. Los lineales van de (v1, val1) a (v2, val2)
+ * en la unidad indicada; si el sensor se muestra en otra unidad (por ejemplo bar en vez
+ * de psi) se convierte solo.
+ * OJO: el numero de tipo se guarda en la memoria. Agregar tipos nuevos SOLO al final. */
 typedef struct {
-    const char *name;
+    const char *label;
     curve_kind_t kind;
     float v1, val1, v2, val2;
     const char *unit;
@@ -81,25 +82,31 @@ typedef struct {
 #define NTC(t) CURVE_NTC_TABLE, 0, 0, 0, 0, "c", t, (int)(sizeof(t) / sizeof(t[0]))
 
 static const curve_preset_t s_presets[] = {
+    [SENSOR_TYPE_LINEAL] = { "Personalizado (2 puntos)", CURVE_LINEAR, 0, 0, 5, 5, NULL, NULL, 0 },
+    [SENSOR_TYPE_NTC]    = { "NTC personalizada (R25 y beta)", CURVE_NTC_BETA, 0, 0, 0, 0, "c", NULL, 0 },
     /* Presion: los comunes de 0,5 a 4,5 V */
-    { "pres_100psi",    CURVE_LINEAR, 0.5f, 0,    4.5f, 100,  "psi", NULL, 0 },
-    { "pres_150psi",    CURVE_LINEAR, 0.5f, 0,    4.5f, 150,  "psi", NULL, 0 },
-    { "pres_10bar",     CURVE_LINEAR, 0.5f, 0,    4.5f, 10,   "bar", NULL, 0 },
+    { "Presion 0-100 psi (0,5-4,5 V)", CURVE_LINEAR, 0.5f, 0,    4.5f, 100,  "psi", NULL, 0 },
+    { "Presion 0-150 psi (0,5-4,5 V)", CURVE_LINEAR, 0.5f, 0,    4.5f, 150,  "psi", NULL, 0 },
+    { "Presion 0-10 bar (0,5-4,5 V)",  CURVE_LINEAR, 0.5f, 0,    4.5f, 10,   "bar", NULL, 0 },
     /* MAP: dan presion absoluta, se pasa a presion de turbo (0 = atmosferica) */
-    { "map_2bar",       CURVE_LINEAR, 0.5f, 20,   4.5f, 200,  "kpa_abs", NULL, 0 },
-    { "map_3bar",       CURVE_LINEAR, 0.5f, 20,   4.5f, 300,  "kpa_abs", NULL, 0 },
-    { "map_4bar",       CURVE_LINEAR, 0.5f, 20,   4.5f, 400,  "kpa_abs", NULL, 0 },
+    { "MAP 2 bar (0,5-4,5 V)",         CURVE_LINEAR, 0.5f, 20,   4.5f, 200,  "kpa_abs", NULL, 0 },
+    { "MAP 3 bar (0,5-4,5 V)",         CURVE_LINEAR, 0.5f, 20,   4.5f, 300,  "kpa_abs", NULL, 0 },
+    { "MAP 4 bar (0,5-4,5 V)",         CURVE_LINEAR, 0.5f, 20,   4.5f, 400,  "kpa_abs", NULL, 0 },
     /* Banda ancha (salida analogica del controlador) */
-    { "wideband_10_20", CURVE_LINEAR, 0.0f, 10,   5.0f, 20,   "afr", NULL, 0 },
-    { "wideband_aem_x", CURVE_LINEAR, 0.5f, 8.5f, 4.5f, 18,   "afr", NULL, 0 },
-    { "wideband_innovate", CURVE_LINEAR, 0.0f, 7.35f, 5.0f, 22.39f, "afr", NULL, 0 },
+    { "Banda ancha 0-5 V = 10-20 AFR", CURVE_LINEAR, 0.0f, 10,   5.0f, 20,   "afr", NULL, 0 },
+    { "Banda ancha AEM X-Series",      CURVE_LINEAR, 0.5f, 8.5f, 4.5f, 18,   "afr", NULL, 0 },
+    { "Banda ancha Innovate LC-2",     CURVE_LINEAR, 0.0f, 7.35f, 5.0f, 22.39f, "afr", NULL, 0 },
     /* Termocupla con amplificador de 0-5 V (5 mV/°C) */
-    { "egt_5mv",        CURVE_LINEAR, 0.0f, 0,    5.0f, 1000, "c", NULL, 0 },
+    { "EGT amplificador 5 mV/C",       CURVE_LINEAR, 0.0f, 0,    5.0f, 1000, "c", NULL, 0 },
     /* Mide el voltaje directo (bateria) */
-    { "volts",          CURVE_LINEAR, 0.0f, 0,    1.0f, 1,    "v", NULL, 0 },
-    { "ntc_bosch",      NTC(s_ntc_bosch) },
-    { "ntc_gm",         NTC(s_ntc_gm) },
+    { "Voltaje directo (bateria)",     CURVE_LINEAR, 0.0f, 0,    1.0f, 1,    "v", NULL, 0 },
+    { "Temperatura NTC tipo Bosch",    NTC(s_ntc_bosch) },
+    { "Temperatura NTC tipo GM",       NTC(s_ntc_gm) },
 };
+
+#define PRESET_COUNT    ((int)(sizeof(s_presets) / sizeof(s_presets[0])))
+#define TYPE_VOLTS      12
+#define TYPE_NTC_BOSCH  13
 
 /* Pasa una presion entre psi, bar y kPa absolutos. Lo demas queda igual. */
 static bool pressure_to_kpa(const char *unit, float v, float *kpa)
@@ -128,7 +135,6 @@ static float convert_unit(float v, const char *from, const char *to)
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
-    int gpio;
     int edge_rising;
     float scale;               /* valor = scale / periodo_us */
     uint32_t min_us;           /* pulsos mas cortos que esto son ruido */
@@ -139,23 +145,13 @@ typedef struct {
 } pulse_t;
 
 typedef struct {
-    sensor_source_t src;
-    /* analogico */
-    int gpio;
+    sensor_setup_t set;        /* lo que se configura desde el menu */
+    sensor_source_t src;       /* fuente en uso (OFF si el pin no sirvio) */
+    const curve_preset_t *curve;
     adc_unit_t unit;
     adc_channel_t chan;
     adc_cali_handle_t cali;
-    float divisor;             /* voltaje en el sensor = voltaje en el pin * divisor */
-    float filter;              /* 0..1: 1 = sin filtro */
-    curve_kind_t kind;
-    float v1, val1, v2, val2;
-    char unit_from[12];
-    const ntc_pt_t *table;
-    int table_len;
-    float pullup, vpullup;     /* NTC: resistencia de pull-up y a que voltaje va */
-    float r25, beta;           /* NTC personalizado */
     bool have_value;
-    /* pulsos */
     pulse_t pulse;
 } sensor_cfg_t;
 
@@ -226,16 +222,17 @@ static float pulse_value(pulse_t *p)
 
 static float ntc_temp(const sensor_cfg_t *c, float volts)
 {
-    if (volts <= 0.01f || volts >= c->vpullup - 0.01f) {
+    const sensor_setup_t *s = &c->set;
+    if (volts <= 0.01f || volts >= s->vpullup - 0.01f) {
         return NAN;            /* cable cortado o en corto */
     }
-    float r = c->pullup * volts / (c->vpullup - volts);
-    if (c->kind == CURVE_NTC_BETA) {
-        float inv_t = 1.0f / 298.15f + logf(r / c->r25) / c->beta;
+    float r = s->pullup * volts / (s->vpullup - volts);
+    if (c->curve->kind == CURVE_NTC_BETA) {
+        float inv_t = 1.0f / 298.15f + logf(r / s->r25) / s->beta;
         return 1.0f / inv_t - 273.15f;
     }
-    const ntc_pt_t *t = c->table;
-    int n = c->table_len;
+    const ntc_pt_t *t = c->curve->table;
+    int n = c->curve->table_len;
     /* La tabla va de frio (mucha resistencia) a caliente (poca) */
     if (r >= t[0].ohms) return t[0].celsius;
     if (r <= t[n - 1].ohms) return t[n - 1].celsius;
@@ -251,11 +248,20 @@ static float ntc_temp(const sensor_cfg_t *c, float volts)
 
 static float analog_curve(const sensor_cfg_t *c, sensor_id_t id, float volts)
 {
-    if (c->kind != CURVE_LINEAR) {
+    const curve_preset_t *p = c->curve;
+    if (p->kind != CURVE_LINEAR) {
         return ntc_temp(c, volts);
     }
-    float v = c->val1 + (volts - c->v1) * (c->val2 - c->val1) / (c->v2 - c->v1);
-    return convert_unit(v, c->unit_from, s_info[id].unit);
+    if (c->set.type == SENSOR_TYPE_LINEAL) {
+        /* Personalizado: los dos puntos ya estan en la unidad del sensor */
+        const sensor_setup_t *s = &c->set;
+        if (s->v2 == s->v1) {
+            return s->val1;
+        }
+        return s->val1 + (volts - s->v1) * (s->val2 - s->val1) / (s->v2 - s->v1);
+    }
+    float v = p->val1 + (volts - p->v1) * (p->val2 - p->val1) / (p->v2 - p->v1);
+    return convert_unit(v, p->unit, s_info[id].unit);
 }
 
 static bool analog_read_volts(sensor_cfg_t *c, float *out)
@@ -273,15 +279,14 @@ static bool analog_read_volts(sensor_cfg_t *c, float *out)
     if (!c->cali || adc_cali_raw_to_voltage(c->cali, raw, &mv) != ESP_OK) {
         mv = raw * 3300 / 4095;  /* sin calibracion: aproximado */
     }
-    *out = mv / 1000.0f * c->divisor;
+    *out = mv / 1000.0f * c->set.divisor;
     return true;
 }
 
 static bool analog_setup(sensor_cfg_t *c, sensor_id_t id)
 {
-    if (adc_oneshot_io_to_channel(c->gpio, &c->unit, &c->chan) != ESP_OK) {
-        ESP_LOGE(TAG, "%s: el GPIO%d no tiene ADC (en el P4 son GPIO16-23 y GPIO49-54)",
-                 s_info[id].key, c->gpio);
+    if (adc_oneshot_io_to_channel(c->set.gpio, &c->unit, &c->chan) != ESP_OK) {
+        ESP_LOGE(TAG, "%s: el GPIO%d no tiene ADC", s_info[id].key, c->set.gpio);
         return false;
     }
     if (!s_adc[c->unit]) {
@@ -312,21 +317,26 @@ static bool analog_setup(sensor_cfg_t *c, sensor_id_t id)
 static bool pulse_setup(sensor_cfg_t *c, sensor_id_t id)
 {
     pulse_t *p = &c->pulse;
+    float pulses = c->set.pulses > 0 ? c->set.pulses : (id == SENSOR_SPEED ? 4000 : 2);
+    p->scale = id == SENSOR_SPEED ? 3.6e9f / pulses   /* km/h con pulsos por km */
+                                  : 60e6f / pulses;   /* rpm con pulsos por vuelta */
+    p->min_us = 200;
+    p->edge_rising = c->set.edge_rising;
     gpio_config_t io = {
-        .pin_bit_mask = 1ULL << p->gpio,
+        .pin_bit_mask = 1ULL << c->set.gpio,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,   /* optoacoplador / sensor hall a masa */
         .intr_type = p->edge_rising ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE,
     };
     if (gpio_config(&io) != ESP_OK) {
-        ESP_LOGE(TAG, "%s: GPIO%d invalido", s_info[id].key, p->gpio);
+        ESP_LOGE(TAG, "%s: GPIO%d invalido", s_info[id].key, c->set.gpio);
         return false;
     }
     esp_err_t err = gpio_install_isr_service(0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE = ya estaba */
         return false;
     }
-    return gpio_isr_handler_add(p->gpio, pulse_isr, p) == ESP_OK;
+    return gpio_isr_handler_add(c->set.gpio, pulse_isr, p) == ESP_OK;
 }
 
 /* Pines que ya usa la placa (pantalla, tactil, audio, SD, USB, consola) */
@@ -342,186 +352,146 @@ static bool gpio_reserved(int gpio)
     return false;
 }
 
-/* ------------------------------------------------------------------------- */
-/* sensores.txt                                                               */
-/* ------------------------------------------------------------------------- */
-
-static char *trim(char *s)
+bool sensors_gpio_ok(int gpio, bool analog)
 {
-    while (isspace((unsigned char)*s)) s++;
-    char *e = s + strlen(s);
-    while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
-    return s;
-}
-
-static int sensor_by_key(const char *k)
-{
-    for (int i = 0; i < SENSOR_COUNT; i++) {
-        if (!strcasecmp(k, s_info[i].key)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static const curve_preset_t *find_preset(const char *name)
-{
-    for (size_t i = 0; i < sizeof(s_presets) / sizeof(s_presets[0]); i++) {
-        if (!strcasecmp(name, s_presets[i].name)) {
-            return &s_presets[i];
-        }
-    }
-    return NULL;
-}
-
-static void apply_preset(sensor_cfg_t *c, const curve_preset_t *p)
-{
-    c->kind = p->kind;
-    c->v1 = p->v1; c->val1 = p->val1; c->v2 = p->v2; c->val2 = p->val2;
-    strlcpy(c->unit_from, p->unit, sizeof(c->unit_from));
-    c->table = p->table;
-    c->table_len = p->table_len;
-}
-
-/* Valores de arranque de cada sensor (antes de leer sus parametros) */
-static void defaults(sensor_cfg_t *c, sensor_id_t id, float divisor)
-{
-    memset(c, 0, sizeof(*c));
-    c->gpio = -1;
-    c->divisor = divisor;
-    c->pullup = 2200;
-    c->vpullup = 3.3f;
-    c->r25 = 2500;     /* parecido al Bosch */
-    c->beta = 3500;
-    c->kind = CURVE_LINEAR;
-    c->v1 = 0; c->val1 = 0; c->v2 = 5; c->val2 = 5;
-    strlcpy(c->unit_from, s_info[id].unit, sizeof(c->unit_from));
-    switch (id) {
-    case SENSOR_WATER_TEMP: case SENSOR_OIL_TEMP: case SENSOR_IAT:
-        c->filter = 0.05f;   /* las temperaturas cambian lento: mucho filtro */
-        apply_preset(c, find_preset("ntc_bosch"));
-        break;
-    case SENSOR_BATTERY:
-        c->filter = 0.1f;
-        c->divisor = 11;     /* divisor tipico: 100k + 10k */
-        c->kind = CURVE_LINEAR; c->v1 = 0; c->val1 = 0; c->v2 = 1; c->val2 = 1;
-        strlcpy(c->unit_from, "v", sizeof(c->unit_from));
-        break;
-    default:
-        c->filter = 0.3f;
-        break;
-    }
-    c->pulse.gpio = -1;
-    c->pulse.min_us = 200;
-    c->pulse.scale = id == SENSOR_SPEED ? 3.6e9f / 4000.0f   /* 4000 pulsos por km */
-                                        : 60e6f / 2.0f;      /* 2 pulsos por vuelta (4 cil.) */
-}
-
-static void parse_params(sensor_cfg_t *c, sensor_id_t id, char *rest)
-{
-    float ppr = 0, ppk = 0;
-    for (char *tok = strtok(rest, ","); tok; tok = strtok(NULL, ",")) {
-        char *eq = strchr(tok, '=');
-        if (!eq) {
-            continue;
-        }
-        *eq = 0;
-        char *k = trim(tok), *v = trim(eq + 1);
-        float f = strtof(v, NULL);
-        if (!strcasecmp(k, "gpio")) { c->gpio = atoi(v); c->pulse.gpio = c->gpio; }
-        else if (!strcasecmp(k, "tipo")) {
-            const curve_preset_t *preset = find_preset(v);
-            bool found = preset != NULL;
-            if (preset) apply_preset(c, preset);
-            if (!strcasecmp(v, "ntc")) { c->kind = CURVE_NTC_BETA; found = true; }
-            if (!strcasecmp(v, "lineal")) { c->kind = CURVE_LINEAR; found = true; }
-            if (!found) ESP_LOGW(TAG, "%s: tipo '%s' desconocido", s_info[id].key, v);
-        }
-        else if (!strcasecmp(k, "v1")) c->v1 = f;
-        else if (!strcasecmp(k, "val1")) c->val1 = f;
-        else if (!strcasecmp(k, "v2")) c->v2 = f;
-        else if (!strcasecmp(k, "val2")) c->val2 = f;
-        else if (!strcasecmp(k, "unidad")) strlcpy(c->unit_from, v, sizeof(c->unit_from));
-        else if (!strcasecmp(k, "divisor")) c->divisor = f;
-        else if (!strcasecmp(k, "filtro")) c->filter = f;
-        else if (!strcasecmp(k, "pullup")) c->pullup = f;
-        else if (!strcasecmp(k, "vpullup")) c->vpullup = f;
-        else if (!strcasecmp(k, "r25")) c->r25 = f;
-        else if (!strcasecmp(k, "beta")) c->beta = f;
-        else if (!strcasecmp(k, "pulsos_vuelta")) ppr = f;
-        else if (!strcasecmp(k, "cilindros")) ppr = f / 2.0f;   /* 4 tiempos, una chispa cada 2 vueltas */
-        else if (!strcasecmp(k, "pulsos_km")) ppk = f;
-        else if (!strcasecmp(k, "flanco")) c->pulse.edge_rising = !strcasecmp(v, "subida");
-        else if (!strcasecmp(k, "min_us")) c->pulse.min_us = (uint32_t)f;
-        else ESP_LOGW(TAG, "%s: parametro '%s' desconocido", s_info[id].key, k);
-    }
-    if (ppr > 0) c->pulse.scale = 60e6f / ppr;
-    if (ppk > 0) c->pulse.scale = 3.6e9f / ppk;
-    if (c->filter <= 0 || c->filter > 1) c->filter = 1;
-    if (c->kind == CURVE_LINEAR && c->v2 == c->v1) c->v2 = c->v1 + 1;
-}
-
-static sensor_source_t parse_source(const char *s)
-{
-    if (!strcasecmp(s, "analog") || !strcasecmp(s, "analogico")) return SENSOR_SRC_ANALOG;
-    if (!strcasecmp(s, "pulso") || !strcasecmp(s, "pulsos")) return SENSOR_SRC_PULSE;
-    if (!strcasecmp(s, "ecu") || !strcasecmp(s, "can") || !strcasecmp(s, "obd")) return SENSOR_SRC_ECU;
-    if (!strcasecmp(s, "sim") || !strcasecmp(s, "simulado")) return SENSOR_SRC_SIM;
-    return SENSOR_SRC_OFF;
-}
-
-/* false = no hay archivo */
-static bool load_config(void)
-{
-    FILE *f = fopen(CONFIG_PATH, "r");
-    if (!f) {
+    if (gpio < 0 || gpio > 54 || gpio_reserved(gpio)) {
         return false;
     }
-    char line[256];
-    bool simulate_rest = false;
-    float divisor = 1.0f;
-    bool listed[SENSOR_COUNT] = { 0 };
-    /* Primera pasada: opciones generales, que valen para todos los sensores */
-    while (fgets(line, sizeof(line), f)) {
-        char *hash = strchr(line, '#');
-        if (hash) *hash = 0;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        char *k = trim(line), *v = trim(eq + 1);
-        if (!strcasecmp(k, "simular")) simulate_rest = !strcasecmp(v, "si");
-        else if (!strcasecmp(k, "divisor")) divisor = strtof(v, NULL);
+    /* ADC del P4: GPIO16-23 y GPIO49-54 */
+    return !analog || (gpio >= 16 && gpio <= 23) || (gpio >= 49 && gpio <= 54);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Configuracion guardada en la memoria interna                               */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    uint16_t version;
+    uint16_t size;             /* sizeof(sensor_setup_t), por si cambia */
+    uint8_t count;             /* SENSOR_COUNT cuando se guardo */
+    sensor_setup_t setups[SENSOR_COUNT];
+} saved_setup_t;
+
+void sensors_default_setup(sensor_id_t id, sensor_setup_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->src = SENSOR_SRC_OFF;
+    s->gpio = -1;
+    s->type = SENSOR_TYPE_LINEAL;
+    s->v1 = 0; s->val1 = 0; s->v2 = 5; s->val2 = 100;
+    s->divisor = 1.5f;         /* entrada de 5 V con divisor 10k / 20k */
+    s->filter = 0.3f;
+    s->pullup = 2200;
+    s->vpullup = 3.3f;
+    s->r25 = 2500;             /* parecido al Bosch */
+    s->beta = 3500;
+    switch (id) {
+    case SENSOR_WATER_TEMP: case SENSOR_OIL_TEMP: case SENSOR_IAT:
+        s->type = TYPE_NTC_BOSCH;
+        s->divisor = 1.0f;     /* la NTC va directo al pin con pull-up a 3,3 V */
+        s->filter = 0.05f;     /* las temperaturas cambian lento: mucho filtro */
+        break;
+    case SENSOR_BATTERY:
+        s->type = TYPE_VOLTS;
+        s->divisor = 11;       /* divisor tipico: 100k + 10k */
+        s->filter = 0.1f;
+        break;
+    case SENSOR_RPM:
+        s->pulses = 2;         /* 4 cilindros, 4 tiempos */
+        break;
+    case SENSOR_SPEED:
+        s->pulses = 4000;
+        break;
+    default:
+        break;
     }
-    for (int i = 0; i < SENSOR_COUNT; i++) {
-        defaults(&s_cfg[i], i, divisor);
+}
+
+/* false = nunca se configuro (o la memoria tiene una version vieja) */
+static bool load_setup(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
     }
-    rewind(f);
-    while (fgets(line, sizeof(line), f)) {
-        char *hash = strchr(line, '#');
-        if (hash) *hash = 0;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = 0;
-        int id = sensor_by_key(trim(line));
-        if (id < 0) {
-            continue;          /* simular=, divisor= o una clave que no es de sensor */
+    saved_setup_t *saved = calloc(1, sizeof(*saved));
+    size_t size = sizeof(*saved);
+    bool ok = saved && nvs_get_blob(h, NVS_KEY, saved, &size) == ESP_OK;
+    nvs_close(h);
+    ok = ok && saved->version == SETUP_VERSION && saved->size == sizeof(sensor_setup_t);
+    if (ok) {
+        /* Si despues se agregan sensores, los nuevos arrancan apagados */
+        size_t n = saved->count < SENSOR_COUNT ? saved->count : SENSOR_COUNT;
+        for (size_t i = 0; i < SENSOR_COUNT; i++) {
+            if (i < n) {
+                s_cfg[i].set = saved->setups[i];
+            } else {
+                sensors_default_setup(i, &s_cfg[i].set);
+            }
         }
-        char *rest = eq + 1;
-        char *comma = strchr(rest, ',');
-        if (comma) *comma = 0;
-        s_cfg[id].src = parse_source(trim(rest));
-        listed[id] = true;
-        if (comma) {
-            parse_params(&s_cfg[id], id, comma + 1);
-        }
     }
-    fclose(f);
-    for (int i = 0; i < SENSOR_COUNT; i++) {
-        if (!listed[i] && simulate_rest) {
-            s_cfg[i].src = SENSOR_SRC_SIM;
-        }
+    free(saved);
+    return ok;
+}
+
+esp_err_t sensors_save_setup(const sensor_setup_t setups[SENSOR_COUNT])
+{
+    saved_setup_t *saved = calloc(1, sizeof(*saved));
+    if (!saved) {
+        return ESP_ERR_NO_MEM;
     }
-    return true;
+    saved->version = SETUP_VERSION;
+    saved->size = sizeof(sensor_setup_t);
+    saved->count = SENSOR_COUNT;
+    memcpy(saved->setups, setups, sizeof(saved->setups));
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, NVS_KEY, saved, sizeof(*saved));
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    free(saved);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo guardar la configuracion: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t sensors_erase_setup(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_erase_key(h, NVS_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    return err;
+}
+
+void sensors_get_setup(sensor_id_t id, sensor_setup_t *out)
+{
+    if (id < SENSOR_COUNT) {
+        *out = s_cfg[id].set;
+    }
+}
+
+int sensors_type_count(void)
+{
+    return PRESET_COUNT;
+}
+
+const char *sensors_type_label(int type)
+{
+    return type >= 0 && type < PRESET_COUNT ? s_presets[type].label : "?";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -575,7 +545,8 @@ static void sensors_task(void *arg)
                 s_volts[i] = volts;
                 float v = analog_curve(c, i, volts);
                 if (isnan(v)) break;           /* sensor desconectado: queda el ultimo valor */
-                s_values[i] = c->have_value ? s_values[i] + (v - s_values[i]) * c->filter : v;
+                float k = c->set.filter > 0 && c->set.filter <= 1 ? c->set.filter : 1;
+                s_values[i] = c->have_value ? s_values[i] + (v - s_values[i]) * k : v;
                 c->have_value = true;
                 break;
             }
@@ -590,7 +561,7 @@ static void sensors_task(void *arg)
 static const char *src_name(sensor_source_t s)
 {
     static const char *n[] = { "apagado", "simulado", "analogico", "pulsos", "ecu" };
-    return n[s];
+    return s <= SENSOR_SRC_ECU ? n[s] : "?";
 }
 
 void sensors_start(void)
@@ -598,35 +569,36 @@ void sensors_start(void)
     for (int i = 0; i < SENSOR_COUNT; i++) {
         s_volts[i] = NAN;
     }
-    if (!load_config()) {
-        ESP_LOGW(TAG, "No hay %s: todos los valores SIMULADOS", CONFIG_PATH);
+    if (!load_setup()) {
+        ESP_LOGW(TAG, "Sensores sin configurar: todos los valores SIMULADOS");
         for (int i = 0; i < SENSOR_COUNT; i++) {
-            defaults(&s_cfg[i], i, 1.0f);
-            s_cfg[i].src = SENSOR_SRC_SIM;
+            sensors_default_setup(i, &s_cfg[i].set);
+            s_cfg[i].set.src = SENSOR_SRC_SIM;
         }
     }
     for (int i = 0; i < SENSOR_COUNT; i++) {
         sensor_cfg_t *c = &s_cfg[i];
+        c->src = c->set.src <= SENSOR_SRC_ECU ? (sensor_source_t)c->set.src : SENSOR_SRC_OFF;
+        if (c->set.type >= PRESET_COUNT) {
+            c->set.type = SENSOR_TYPE_LINEAL;
+        }
+        c->curve = &s_presets[c->set.type];
         if (c->src == SENSOR_SRC_ANALOG || c->src == SENSOR_SRC_PULSE) {
-            bool ok = c->gpio >= 0 && !gpio_reserved(c->gpio);
-            if (c->gpio >= 0 && gpio_reserved(c->gpio)) {
-                ESP_LOGE(TAG, "%s: el GPIO%d lo usa la placa", s_info[i].key, c->gpio);
-            } else if (c->gpio < 0) {
-                ESP_LOGE(TAG, "%s: falta gpio=", s_info[i].key);
-            }
-            if (ok) {
-                ok = c->src == SENSOR_SRC_ANALOG ? analog_setup(c, i) : pulse_setup(c, i);
+            bool analog = c->src == SENSOR_SRC_ANALOG;
+            bool ok = sensors_gpio_ok(c->set.gpio, analog);
+            if (!ok) {
+                ESP_LOGE(TAG, "%s: el GPIO%d no sirve para esto", s_info[i].key, c->set.gpio);
+            } else {
+                ok = analog ? analog_setup(c, i) : pulse_setup(c, i);
             }
             if (!ok) {
                 c->src = SENSOR_SRC_OFF;
             }
         }
-        if (c->src != SENSOR_SRC_OFF) {
-            if (c->src == SENSOR_SRC_ANALOG || c->src == SENSOR_SRC_PULSE) {
-                ESP_LOGI(TAG, "%-12s %s en GPIO%d", s_info[i].key, src_name(c->src), c->gpio);
-            } else {
-                ESP_LOGI(TAG, "%-12s %s", s_info[i].key, src_name(c->src));
-            }
+        if (c->src == SENSOR_SRC_ANALOG || c->src == SENSOR_SRC_PULSE) {
+            ESP_LOGI(TAG, "%-12s %s en GPIO%d", s_info[i].key, src_name(c->src), c->set.gpio);
+        } else if (c->src != SENSOR_SRC_OFF) {
+            ESP_LOGI(TAG, "%-12s %s", s_info[i].key, src_name(c->src));
         }
     }
     xTaskCreate(sensors_task, "sensors", 4096, NULL, 4, NULL);
