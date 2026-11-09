@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "usb_mode.h"
+#include "settings.h"
 #include "src/draw/lv_image_decoder_private.h"
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
@@ -1272,7 +1273,7 @@ static void screen_long_press_cb(lv_event_t *e)
         long_pressed = true;
     } else if (code == LV_EVENT_RELEASED && long_pressed) {
         long_pressed = false;
-        menu_open();
+        settings_open();   /* menu de configuracion a pantalla completa (settings.c) */
     } else if (code == LV_EVENT_PRESSED) {
         long_pressed = false;
     }
