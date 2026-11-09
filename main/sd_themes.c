@@ -43,6 +43,10 @@ static const struct {
     { "valor_pres_aceite", SENSOR_OIL_PRESS },
     { "valor_bateria", SENSOR_BATTERY },
     { "valor_afr", SENSOR_AFR },
+    { "valor_pres_nafta", SENSOR_FUEL_PRESS },
+    { "valor_admision", SENSOR_IAT },
+    { "valor_tps", SENSOR_TPS },
+    { "valor_egt", SENSOR_EGT },
 };
 
 /* Reloj con aguja (lo arma el armador):
@@ -619,13 +623,19 @@ static dash_theme_t *build_theme(const char *name)
     static const sensor_id_t order[] = {
         SENSOR_SPEED, SENSOR_WATER_TEMP, SENSOR_OIL_TEMP, SENSOR_OIL_PRESS,
         SENSOR_BOOST, SENSOR_BATTERY, SENSOR_AFR, SENSOR_RPM,
+        /* Los nuevos solo aparecen si dashboard.txt los ubica (valor_pres_nafta=...),
+         * asi no se pierde lo que ya estaba acomodado en los dashboards de antes */
+        SENSOR_FUEL_PRESS, SENSOR_IAT, SENSOR_TPS, SENSOR_EGT,
     };
     for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
         sensor_id_t id = order[i];
+        if (i >= 8 && !cfg.values[id].set) {
+            continue;
+        }
         els[n++] = (dash_element_t) {
             .type = DASH_EL_VALUE, .sensor = id, .movable = true,
             .hidden = (id == SENSOR_AFR || id == SENSOR_RPM),
-            .x = i < 4 ? 30 : 760, .y = 100 + (i % 4) * 120,
+            .x = (i % 8) < 4 ? 30 : 760, .y = 100 + (i % 4) * 120,
             .font = fonts.value ? fonts.value : VALUE_FONT, .caption_font = fonts.caption,
             .color = cfg.color, .caption_color = cfg.name_color,
             .caption = cfg.has_name[id] ? strdup(cfg.names[id]) : sensors_info(id)->name,
