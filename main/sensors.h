@@ -58,6 +58,44 @@ typedef struct {
     float pulses;           /* rpm: pulsos por vuelta / velocidad: pulsos por km */
 } sensor_setup_t;
 
+/* ------------------------------------------------------------------------- */
+/* Entradas fijas de la placa de sensores                                     */
+/* ------------------------------------------------------------------------- */
+/* Cada valor tiene su entrada en la placa, con el circuito ya armado (divisor,
+ * pull-up y proteccion), asi en el menu solo se elige que sensor esta conectado.
+ * Los canales de los ADS1115 se guardan como "pines" 100 a 107. */
+#define SENSOR_PIN_ADS(chip, ch)  (100 + (chip) * 4 + (ch))
+#define SENSOR_PIN_IS_ADS(pin)    ((pin) >= 100 && (pin) < 108)
+#define SENSOR_PIN_ADS_CHIP(pin)  (((pin) - 100) / 4)
+#define SENSOR_PIN_ADS_CH(pin)    (((pin) - 100) % 4)
+
+typedef enum {
+    INPUT_KIND_5V = 0,    /* sensor de 0-5 V: divisor 10k arriba / 20k abajo */
+    INPUT_KIND_NTC,       /* NTC a masa, pull-up de 1k a 3,3 V */
+    INPUT_KIND_BATTERY,   /* divisor 100k / 10k */
+    INPUT_KIND_PULSE,     /* optoacoplador (RPM, velocidad) */
+} input_kind_t;
+
+typedef struct {
+    const char *name;     /* lo que dice la ficha de la placa: "TURBO", "AGUA"... */
+    int8_t pin;           /* GPIO o SENSOR_PIN_ADS() */
+    uint8_t kind;         /* input_kind_t */
+} sensor_input_t;
+
+/* Entrada fija de ese valor en la placa */
+const sensor_input_t *sensors_board_input(sensor_id_t id);
+/* Pone en s el pin y el circuito (divisor, pull-up) de la entrada fija */
+void sensors_apply_board_input(sensor_id_t id, sensor_setup_t *s);
+/* true si s usa la entrada fija tal cual (si no, es un cableado a medida) */
+bool sensors_uses_board_input(sensor_id_t id, const sensor_setup_t *s);
+/* "IO49", "ADS1115 #1 A0"... */
+void sensors_pin_name(int pin, char *buf, int len);
+/* true si ese tipo de sensor tiene sentido para ese valor (la lista corta del menu) */
+bool sensors_type_fits(sensor_id_t id, int type);
+/* Si el sensor no se puede leer, por que (por ejemplo "no se encuentra el ADS1115 #1").
+ * NULL si anda. */
+const char *sensors_problem(sensor_id_t id);
+
 /* Arranca la lectura de sensores con la configuracion guardada. Si nunca se
  * configuro nada, todos los valores quedan simulados (como hasta ahora). */
 void sensors_start(void);
@@ -71,7 +109,8 @@ esp_err_t sensors_save_setup(const sensor_setup_t setups[SENSOR_COUNT]);
 esp_err_t sensors_erase_setup(void);
 int sensors_type_count(void);
 const char *sensors_type_label(int type);
-/* false si ese GPIO no se puede usar (lo usa la placa, o no tiene ADC y analog = true) */
+/* false si ese pin no se puede usar (no esta en las fichas de la placa, o no tiene ADC y
+ * analog = true). Acepta los canales de los ADS1115 (solo analogicos). */
 bool sensors_gpio_ok(int gpio, bool analog);
 
 float sensors_get(sensor_id_t id);
