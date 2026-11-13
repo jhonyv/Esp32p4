@@ -1,10 +1,10 @@
 file(GLOB ASSET_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/assets/*.c")
 
 idf_component_register(
-    SRCS main.c dashboard.c sensors.c theme_initial_d.c theme_barras.c sd_themes.c usb_mode.c ${ASSET_SRCS}
+    SRCS main.c dashboard.c sensors.c ads1115.c theme_initial_d.c theme_barras.c sd_themes.c usb_mode.c settings.c ecu.c ${ASSET_SRCS}
     INCLUDE_DIRS .
     REQUIRES esp32_p4_wifi6_touch_lcd_7b lvgl__lvgl esp_timer nvs_flash espressif__esp_lv_decoder
-             espressif__esp_tinyusb sdmmc esp_driver_sdmmc soc)
+             espressif__esp_tinyusb sdmmc esp_driver_sdmmc soc esp_adc esp_driver_gpio esp_driver_twai esp_driver_i2c)
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
 target_compile_options(

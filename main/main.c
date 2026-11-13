@@ -15,6 +15,7 @@
 #include "sensors.h"
 #include "sd_themes.h"
 #include "usb_mode.h"
+#include "ecu.h"
 
 #define MAX_SD_THEMES 16
 
@@ -56,9 +57,6 @@ void app_main(void)
         return;
     }
 
-    /* true = valores simulados, hasta que conectemos los sensores reales */
-    sensors_start(true);
-
     // lv_demo_music();
     // lv_demo_benchmark();
     // lv_demo_widgets();
@@ -74,6 +72,10 @@ void app_main(void)
     } else {
         ESP_LOGW("main", "No hay SD (o no se pudo leer): solo dashboards de fabrica");
     }
+    /* Sensores: cada uno lee de donde diga /sdcard/sensores.txt (sin archivo = simulados) */
+    sensors_start();
+    /* ECU original por OBD-II (CAN), si esta activada en Configuracion > ECU */
+    ecu_start();
     dashboard_start(themes, theme_count);
 
     bsp_display_unlock();
