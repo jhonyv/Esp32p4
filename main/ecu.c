@@ -62,15 +62,22 @@ static float s_baro = 101.3f;
 
 void ecu_get_config(ecu_config_t *out)
 {
-    ecu_config_t c = { .mode = ECU_MODE_OFF, .tx_gpio = -1, .rx_gpio = -1 };
+    ecu_config_t c = { .mode = ECU_MODE_OFF, .tx_gpio = -1, .rx_gpio = -1, .ms_base = 0 };
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        size_t size = sizeof(c);
         ecu_config_t saved;
-        if (nvs_get_blob(h, NVS_KEY, &saved, &size) == ESP_OK && size == sizeof(saved)) {
-            c = saved;
+        size_t size = sizeof(saved);
+        if (nvs_get_blob(h, NVS_KEY, &saved, &size) == ESP_OK) {
+            if (size == sizeof(saved)) {
+                c = saved;
+            } else if (size == 3) {      /* version anterior: solo modo y pines */
+                memcpy(&c, &saved, 3);
+            }
         }
         nvs_close(h);
+    }
+    if (c.mode > ECU_MODE_MEGASQUIRT) {
+        c.mode = ECU_MODE_OFF;
     }
     *out = c;
 }
@@ -360,6 +367,9 @@ bool ecu_supports(sensor_id_t id)
     if (s_status.state != ECU_STATE_CONNECTED) {
         return false;
     }
+    if (s_cfg.mode == ECU_MODE_MEGASQUIRT) {
+        return id < SENSOR_COUNT && s_have[id];
+    }
     if (id == SENSOR_RPM) {
         return s_supported[PID_RPM];
     }
@@ -369,6 +379,13 @@ bool ecu_supports(sensor_id_t id)
         }
     }
     return false;
+}
+
+static void store_value(sensor_id_t id, float v)
+{
+    s_last[id] = v;
+    s_have[id] = true;
+    sensors_set_ecu(id, v);
 }
 
 static bool request(uint8_t pid)
@@ -388,9 +405,7 @@ static bool request(uint8_t pid)
     sensor_id_t id;
     float v;
     if (ecu_decode_pid(pid, d, n, s_baro, &id, &v)) {
-        s_last[id] = v;
-        s_have[id] = true;
-        sensors_set_ecu(id, v);
+        store_value(id, v);
     }
     return true;
 }
@@ -438,9 +453,227 @@ static void poll(void)
     ESP_LOGW(TAG, "La ECU dejo de contestar");
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* MegaSquirt: "CAN realtime data broadcasting" (500 kbit/s, IDs de 11 bits)  */
+/* Cada grupo de 8 bytes sale en base + grupo. Todo big-endian.               */
+/* ------------------------------------------------------------------------- */
+
+#define MS_BITRATE        500000
+#define MS_LOST_US        1000000   /* un segundo sin datos = desconectada */
+
+static float ms_s16(const uint8_t *d, int off, float div)
+{
+    return (int16_t)((d[off] << 8) | d[off + 1]) / div;
+}
+
+static float ms_u16(const uint8_t *d, int off, float div)
+{
+    return (uint16_t)((d[off] << 8) | d[off + 1]) / div;
+}
+
+static float f_to_c(float f)
+{
+    return (f - 32.0f) * 5.0f / 9.0f;
+}
+
+static bool s_ms_afr_new;   /* llego el grupo 31 (AFR nuevo): se ignora el viejo del grupo 3 */
+
+void ecu_decode_megasquirt(int group, const uint8_t *d, void (*out)(sensor_id_t id, float value))
+{
+    switch (group) {
+    case 0:     /* seconds, pw1, pw2, rpm */
+        out(SENSOR_RPM, ms_u16(d, 6, 1));
+        break;
+    case 2: {   /* baro, map (kPa x10), mat, clt (F x10) */
+        float baro = ms_s16(d, 0, 10), map = ms_s16(d, 2, 10);
+        if (baro < 50 || baro > 120) {
+            baro = 101.3f;
+        }
+        out(SENSOR_BOOST, (map - baro) * 0.145038f);
+        out(SENSOR_IAT, f_to_c(ms_s16(d, 4, 10)));
+        out(SENSOR_WATER_TEMP, f_to_c(ms_s16(d, 6, 10)));
+        break;
+    }
+    case 3:     /* tps (% x10), batt (V x10), afr1_old (x10, MS2) */
+        out(SENSOR_TPS, ms_s16(d, 0, 10));
+        out(SENSOR_BATTERY, ms_s16(d, 2, 10));
+        if (!s_ms_afr_new) {
+            float afr = ms_s16(d, 4, 10);
+            if (afr > 5) {
+                out(SENSOR_AFR, afr);
+            }
+        }
+        break;
+    case 22:    /* egt1 (F x10) */
+        out(SENSOR_EGT, f_to_c(ms_s16(d, 0, 10)));
+        break;
+    case 31:    /* AFR1 (x10, un byte) */
+        s_ms_afr_new = true;
+        out(SENSOR_AFR, d[0] / 10.0f);
+        break;
+    case 42:    /* VSS1 (m/s x10) -> km/h */
+        out(SENSOR_SPEED, ms_u16(d, 0, 10) * 3.6f);
+        break;
+    case 53:    /* fuel_press1 (kPa x10) -> bar */
+        out(SENSOR_FUEL_PRESS, ms_s16(d, 0, 10) / 100.0f);
+        break;
+    default:
+        break;
+    }
+}
+
+/* "Dash broadcasting" simplificado (MS2/Extra 3.4+, MS3): 5 mensajes fijos desde la base
+ * (1512 de fabrica), 4 valores de 16 bits por mensaje salvo el AFR (un byte).
+ * Revisar en Configuracion > ECU que los valores coincidan con TunerStudio. */
+void ecu_decode_megasquirt_dash(int msg, const uint8_t *d, void (*out)(sensor_id_t id, float value))
+{
+    switch (msg) {
+    case 0:     /* MAP (kPa x10), RPM, CLT (F x10), TPS (% x10) */
+        out(SENSOR_BOOST, (ms_s16(d, 0, 10) - 101.3f) * 0.145038f);
+        out(SENSOR_RPM, ms_u16(d, 2, 1));
+        out(SENSOR_WATER_TEMP, f_to_c(ms_s16(d, 4, 10)));
+        out(SENSOR_TPS, ms_s16(d, 6, 10));
+        break;
+    case 1:     /* PW1, PW2, MAT (F x10), avance */
+        out(SENSOR_IAT, f_to_c(ms_s16(d, 4, 10)));
+        break;
+    case 2:     /* AFR objetivo (x10, byte), AFR (x10, byte), ... */
+        if (d[1] > 50) {
+            out(SENSOR_AFR, d[1] / 10.0f);
+        }
+        break;
+    case 3:     /* bateria (V x10), sensores genericos 1 y 2, retardo por detonacion */
+        out(SENSOR_BATTERY, ms_s16(d, 0, 10));
+        break;
+    case 4:     /* VSS1 (m/s x10) -> km/h */
+        out(SENSOR_SPEED, ms_u16(d, 0, 10) * 3.6f);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Busca el ID base: el grupo 2 empieza con la presion atmosferica (~800-1100 = 80-110 kPa)
+ * y el grupo 0 (base) tiene que aparecer tambien. */
+static uint16_t ms_guess_base(const uint32_t *ids, const uint16_t *first2, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (first2[i] < 800 || first2[i] > 1100 || ids[i] < 2) {
+            continue;
+        }
+        uint32_t base = ids[i] - 2;
+        for (int j = 0; j < n; j++) {
+            if (ids[j] == base) {
+                return (uint16_t)base;
+            }
+        }
+    }
+    return 0;
+}
+
+static void megasquirt_loop(void)
+{
+    /* Modo normal (no "solo escuchar"): asi la pantalla le da el ACK a los mensajes.
+     * Si la MegaSquirt esta sola en el bus y nadie confirma, repite y marca error. */
+    if (!node_open(MS_BITRATE, false)) {
+        s_status.state = ECU_STATE_ERROR;
+        return;
+    }
+    s_status.bitrate = MS_BITRATE;
+    s_status.ext_id = false;
+    s_ms_afr_new = false;
+    uint16_t base = s_cfg.ms_base;
+    uint8_t format = s_cfg.ms_format;
+    if (base && format == MS_FORMAT_AUTO) {
+        format = base == 1512 ? MS_FORMAT_DASH : MS_FORMAT_ADVANCED;
+    }
+    if (!base && format == MS_FORMAT_DASH) {
+        base = 1512;
+    }
+    if (!base) {
+        format = MS_FORMAT_AUTO;   /* sin base: se detectan los dos */
+    }
+    s_status.ms_base = base;
+    s_status.ms_format = format;
+    uint32_t seen_ids[24];
+    uint16_t seen_first[24];
+    int seen = 0, frames = 0;
+    int64_t window = esp_timer_get_time(), last_rx = 0;
+    rx_msg_t m;
+    while (!s_bus_off) {
+        int64_t now = esp_timer_get_time();
+        if (xQueueReceive(s_rxq, &m, pdMS_TO_TICKS(100)) == pdTRUE && !m.ext && m.len == 8) {
+            now = esp_timer_get_time();
+            if (!base) {
+                /* Junta IDs distintos para adivinar la base */
+                bool known = false;
+                for (int i = 0; i < seen; i++) {
+                    if (seen_ids[i] == m.id) {
+                        seen_first[i] = (m.data[0] << 8) | m.data[1];
+                        known = true;
+                    }
+                }
+                if (!known && seen < 24) {
+                    seen_ids[seen] = m.id;
+                    seen_first[seen++] = (m.data[0] << 8) | m.data[1];
+                }
+                /* Primero el avanzado (firma de la presion atmosferica en el grupo 2);
+                 * si no, el dash simplificado si aparecen 1512, 1513 y 1514 */
+                base = ms_guess_base(seen_ids, seen_first, seen);
+                format = MS_FORMAT_ADVANCED;
+                if (!base && seen >= 3) {
+                    int dash = 0;
+                    for (int i = 0; i < seen; i++) {
+                        dash += seen_ids[i] >= 1512 && seen_ids[i] <= 1514;
+                    }
+                    if (dash == 3) {
+                        base = 1512;
+                        format = MS_FORMAT_DASH;
+                    }
+                }
+                if (base) {
+                    ESP_LOGI(TAG, "MegaSquirt: %s, ID base %u",
+                             format == MS_FORMAT_DASH ? "dash simplificado" : "broadcast avanzado", base);
+                    s_status.ms_base = base;
+                    s_status.ms_format = format;
+                }
+            }
+            if (base && format == MS_FORMAT_DASH && m.id >= base && m.id < base + 5u) {
+                ecu_decode_megasquirt_dash(m.id - base, m.data, store_value);
+                last_rx = now;
+                frames++;
+                s_status.state = ECU_STATE_CONNECTED;
+            } else if (base && format == MS_FORMAT_ADVANCED && m.id >= base && m.id < base + 64u) {
+                ecu_decode_megasquirt(m.id - base, m.data, store_value);
+                last_rx = now;
+                frames++;
+                s_status.state = ECU_STATE_CONNECTED;
+            }
+        }
+        if (s_status.state == ECU_STATE_CONNECTED && now - last_rx > MS_LOST_US) {
+            ESP_LOGW(TAG, "La MegaSquirt dejo de transmitir");
+            s_status.state = ECU_STATE_SEARCHING;
+        }
+        if (now - window >= 1000000) {
+            s_status.responses_per_s = frames;
+            frames = 0;
+            window = now;
+        }
+    }
+}
+
 static void ecu_task(void *arg)
 {
     (void)arg;
+    if (s_cfg.mode == ECU_MODE_MEGASQUIRT) {
+        while (1) {
+            s_status.state = ECU_STATE_SEARCHING;
+            megasquirt_loop();          /* vuelve solo si el bus quedo apagado (bus-off) o hubo error */
+            node_close();
+            vTaskDelay(pdMS_TO_TICKS(RETRY_MS));
+        }
+    }
     while (1) {
         s_status.state = ECU_STATE_SEARCHING;
         s_status.responses_per_s = 0;
@@ -464,7 +697,7 @@ void ecu_start(void)
 {
     ecu_get_config(&s_cfg);
     s_status.state = ECU_STATE_OFF;
-    if (s_cfg.mode != ECU_MODE_OBD_CAN) {
+    if (s_cfg.mode != ECU_MODE_OBD_CAN && s_cfg.mode != ECU_MODE_MEGASQUIRT) {
         return;
     }
     if (s_cfg.tx_gpio < 0 || s_cfg.rx_gpio < 0 || s_cfg.tx_gpio == s_cfg.rx_gpio ||
@@ -475,7 +708,8 @@ void ecu_start(void)
     s_rxq = xQueueCreate(32, sizeof(rx_msg_t));
     s_status.state = ECU_STATE_SEARCHING;
     xTaskCreate(ecu_task, "ecu", 4096, NULL, 5, NULL);
-    ESP_LOGI(TAG, "OBD-II por CAN en TX GPIO%d / RX GPIO%d", s_cfg.tx_gpio, s_cfg.rx_gpio);
+    ESP_LOGI(TAG, "%s por CAN en TX GPIO%d / RX GPIO%d",
+             s_cfg.mode == ECU_MODE_MEGASQUIRT ? "MegaSquirt" : "OBD-II", s_cfg.tx_gpio, s_cfg.rx_gpio);
 }
 
 void ecu_get_status(ecu_status_t *out)
@@ -485,6 +719,8 @@ void ecu_get_status(ecu_status_t *out)
     out->ext_id = s_status.ext_id;
     out->responses_per_s = s_status.responses_per_s;
     out->pid_count = s_status.pid_count;
+    out->ms_base = s_status.ms_base;
+    out->ms_format = s_status.ms_format;
 }
 
 bool ecu_get_value(sensor_id_t id, float *out)

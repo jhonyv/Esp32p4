@@ -334,8 +334,8 @@ static void page_main(void)
               0x2A2A2A, display_menu_cb, NULL);
     menu_item(p, pin_on && !s_unlocked ? "Sensores  (con clave)" : "Sensores",
               "De donde lee cada valor, tipo de sensor y calibracion", 0x2A2A2A, sensors_cb, NULL);
-    menu_item(p, pin_on && !s_unlocked ? "ECU original  (con clave)" : "ECU original",
-              "Leer la computadora del auto por OBD-II (CAN)", 0x2A2A2A, ecu_cb, NULL);
+    menu_item(p, pin_on && !s_unlocked ? "ECU  (con clave)" : "ECU",
+              "Leer la computadora del auto por CAN: OBD-II o MegaSquirt", 0x2A2A2A, ecu_cb, NULL);
     menu_item(p, "Clave de instalador", pin_on ? "Activada" : "Desactivada", 0x2A2A2A, pin_settings_cb, NULL);
     menu_item(p, "Modo USB", "La SD aparece como pendrive en la compu (reinicia)", 0x2A2A2A, usb_cb, NULL);
     lv_obj_t *f = menu_item(p, "Restablecer de fabrica",
@@ -834,6 +834,14 @@ static void page_sensor_edit(int id)
 static int s_can_pins[56];
 static int s_can_pin_count;
 
+static void ecu_rebuild_async(void *arg)
+{
+    (void)arg;
+    if (s_scr) {
+        page_ecu();
+    }
+}
+
 static void ecu_live_cb(lv_timer_t *t)
 {
     (void)t;
@@ -847,15 +855,23 @@ static void ecu_live_cb(lv_timer_t *t)
         lv_label_set_text(s_ecu_status, "Apagada (se activa al guardar y reiniciar)");
         break;
     case ECU_STATE_SEARCHING:
-        lv_label_set_text(s_ecu_status, "Buscando la ECU...  (contacto puesto? cables CAN-H / CAN-L?)");
+        lv_label_set_text(s_ecu_status, s_ecu_edit.mode == ECU_MODE_MEGASQUIRT
+                          ? "Esperando datos de la MegaSquirt...  (broadcast activado? CAN-H / CAN-L?)"
+                          : "Buscando la ECU...  (contacto puesto? cables CAN-H / CAN-L?)");
         break;
     case ECU_STATE_ERROR:
         lv_label_set_text(s_ecu_status, "No se pudo iniciar el CAN: revisa los pines TX / RX");
         break;
     case ECU_STATE_CONNECTED:
-        lv_label_set_text_fmt(s_ecu_status, "Conectada: %lu kbit/s, IDs de %d bits, informa %d datos, %d respuestas/s",
-                              (unsigned long)(st.bitrate / 1000), st.ext_id ? 29 : 11, st.pid_count,
-                              st.responses_per_s);
+        if (st.ms_base) {
+            lv_label_set_text_fmt(s_ecu_status, "MegaSquirt conectada (%s, ID base %u): %d mensajes/s",
+                                  st.ms_format == MS_FORMAT_DASH ? "dash simplificado" : "broadcast avanzado",
+                                  st.ms_base, st.responses_per_s);
+        } else {
+            lv_label_set_text_fmt(s_ecu_status, "Conectada: %lu kbit/s, IDs de %d bits, informa %d datos, %d respuestas/s",
+                                  (unsigned long)(st.bitrate / 1000), st.ext_id ? 29 : 11, st.pid_count,
+                                  st.responses_per_s);
+        }
         break;
     }
     /* Lo que va mandando, sensor por sensor */
@@ -874,11 +890,12 @@ static void ecu_live_cb(lv_timer_t *t)
     lv_label_set_text(s_ecu_values, buf[0] ? buf : "Todavia no llegaron datos de la ECU.");
 }
 
-static void ecu_switch_cb(lv_event_t *e)
+static void ecu_mode_cb(lv_event_t *e)
 {
-    lv_obj_t *sw = lv_event_get_target(e);
-    s_ecu_edit.mode = lv_obj_has_state(sw, LV_STATE_CHECKED) ? ECU_MODE_OBD_CAN : ECU_MODE_OFF;
+    lv_obj_t *dd = lv_event_get_target(e);
+    s_ecu_edit.mode = (uint8_t)lv_dropdown_get_selected(dd);
     s_ecu_dirty = true;
+    lv_async_call(ecu_rebuild_async, NULL);   /* cambian las instrucciones */
 }
 
 static void ecu_pin_cb(lv_event_t *e)
@@ -916,7 +933,7 @@ static void ecu_auto_cb(lv_event_t *e)
 static void ecu_save_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_ecu_edit.mode == ECU_MODE_OBD_CAN &&
+    if (s_ecu_edit.mode != ECU_MODE_OFF &&
         (s_ecu_edit.tx_gpio < 0 || s_ecu_edit.rx_gpio < 0 || s_ecu_edit.tx_gpio == s_ecu_edit.rx_gpio)) {
         lv_label_set_text(s_ecu_status, "Elegi dos pines distintos para TX y RX");
         return;
@@ -957,7 +974,7 @@ static lv_obj_t *ecu_pin_dropdown(lv_obj_t *parent, const char *name, int curren
 
 static void page_ecu(void)
 {
-    lv_obj_t *p = new_page("ECU ORIGINAL (OBD-II)", ecu_back_cb);
+    lv_obj_t *p = new_page("ECU", ecu_back_cb);
     s_can_pin_count = 0;
     for (int g = 0; g <= 54; g++) {
         /* Para el CAN mejor no gastar pines con ADC (quedan para sensores) */
@@ -968,22 +985,25 @@ static void page_ecu(void)
 
     s_ecu_status = label(p, "", &lv_font_montserrat_20, ACCENT);
 
-    lv_obj_t *r = row(p);
-    lv_obj_t *l = label(r, "Leer la ECU por OBD-II (CAN)", &lv_font_montserrat_22, 0xFFFFFF);
-    lv_obj_set_width(l, 400);
-    lv_obj_t *sw = lv_switch_create(r);
-    lv_obj_set_size(sw, 80, 40);
-    if (s_ecu_edit.mode == ECU_MODE_OBD_CAN) {
-        lv_obj_add_state(sw, LV_STATE_CHECKED);
-    }
-    lv_obj_add_event_cb(sw, ecu_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    add_dropdown(p, "Leer la ECU", "Apagado\nOBD-II (autos de fabrica)\nMegaSquirt (MS2 / MS3 / MicroSquirt)",
+                 s_ecu_edit.mode, ecu_mode_cb);
 
     ecu_pin_dropdown(p, "Pin TX (al transceptor)", s_ecu_edit.tx_gpio, 0);
     ecu_pin_dropdown(p, "Pin RX (del transceptor)", s_ecu_edit.rx_gpio, 1);
 
-    label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230) entre estos pines y el conector OBD:\n"
-             "pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
-          &lv_font_montserrat_14, TEXT_DIM);
+    if (s_ecu_edit.mode == ECU_MODE_MEGASQUIRT) {
+        label(p, "Transceptor CAN de 3,3 V (SN65HVD230) a los cables CAN-H / CAN-L de la MegaSquirt.\n"
+                 "En TunerStudio (firmware MS2/Extra 3.4 o mas nuevo), CAN-bus / Testmodes:\n"
+                 " - CAN Parameters: velocidad 500K.\n"
+                 " - Dash broadcasting = ON (ID base 1512), o bien Realtime data broadcasting = ON\n"
+                 "   con los grupos 0, 2, 3 (y 22 EGT, 31 AFR, 42 velocidad, 53 presion de nafta).\n"
+                 "Grabar (Burn) y reiniciar la ECU. El formato y el ID base se detectan solos.",
+              &lv_font_montserrat_14, TEXT_DIM);
+    } else {
+        label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230) entre estos pines y el conector OBD:\n"
+                 "pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
+              &lv_font_montserrat_14, TEXT_DIM);
+    }
 
     label(p, "Datos que manda la ECU:", &lv_font_montserrat_20, 0xFFFFFF);
     s_ecu_values = label(p, "", &lv_font_montserrat_20, 0xFFFFFF);
