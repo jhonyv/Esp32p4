@@ -32,14 +32,14 @@ Cada valor tiene su borne fijo:
 | TPS | acelerador | ADS1115 #2 A0 | 0-5 V |
 | EGT | temperatura de escape (con amplificador) | ADS1115 #2 A1 | 0-5 V |
 | ADMISION | temperatura de admisión | ADS1115 #2 A2 | NTC |
-| EXTRA | libre (se elige en Avanzado) | ADS1115 #2 A3 | 0-5 V |
+| 5V REF | mide los 5 V de los sensores (no es un borne) | ADS1115 #2 A3 | 0-5 V |
 | CAN H / CAN L | ECU | ficha CAN de la pantalla | ya viene en la pantalla (TJA1051) |
 
 La placa se puede armar por partes:
 
 - **Básica, sin ADS1115**: RPM, velocidad, batería, temperatura de agua y temperatura de aceite. Es lo típico de un carburado.
 - **Con el ADS1115 #1**: suma turbo, presión de aceite, presión de nafta y AFR.
-- **Con el ADS1115 #2**: suma acelerador, EGT, temperatura de admisión y una entrada libre.
+- **Con el ADS1115 #2**: suma acelerador, EGT, temperatura de admisión y la medición de los 5 V de los sensores.
 
 Si un sensor usa un ADS1115 que no está conectado, el menú lo avisa ("no se encuentra el ADS1115 #1").
 
@@ -69,7 +69,7 @@ Ningún pin del ESP32-P4 ni del ADS1115 aguanta más de 3,3 V. Cada borne tiene 
 
 ### Entradas de 0-5 V
 
-Son TURBO, ACEITE P, NAFTA P, AFR, TPS, EGT y EXTRA.
+Son TURBO, ACEITE P, NAFTA P, AFR, TPS y EGT. El canal A3 del ADS1115 #2 lleva el mismo divisor, conectado a los +5 V de los sensores.
 
 ```
 señal del sensor ──[10k]──┬───────────► ADS1115 Ax
@@ -139,7 +139,7 @@ La pantalla también trae RS485 (GPIO27 TX, GPIO26 RX), que sirve más adelante 
 ### Para que mida lo más exacto posible
 
 - Resistencias de los divisores de 0,1 %. Con las comunes de 1 % la lectura se puede correr hasta 1,3 %.
-- Un regulador de 5 V solo para los sensores, no los 5 V que alimentan la pantalla. Los sensores de presión y MAP dan un voltaje proporcional a su alimentación: si les llegan 4,90 V en vez de 5,00 V, marcan 2 % menos.
+- Un regulador de 5 V solo para los sensores, no los 5 V que alimentan la pantalla. Los sensores de presión y MAP dan un voltaje proporcional a su alimentación: si les llegan 4,90 V en vez de 5,00 V, marcan 2 % menos. Por eso el canal A3 del ADS1115 #2 mide esos 5 V y el firmware corrige solo las presiones, el MAP y el TPS. La lista de sensores del menú muestra cuánto miden.
 - Masas de los sensores a la placa, y la placa al block en un solo punto.
 
 ## Tipos de sensor ya calibrados

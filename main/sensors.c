@@ -56,8 +56,11 @@ static const sensor_input_t s_inputs[SENSOR_COUNT] = {
     [SENSOR_TPS]        = { "TPS",        SENSOR_PIN_ADS(1, 0),  INPUT_KIND_5V },
     [SENSOR_EGT]        = { "EGT",        SENSOR_PIN_ADS(1, 1),  INPUT_KIND_5V },
     [SENSOR_IAT]        = { "ADMISION",   SENSOR_PIN_ADS(1, 2),  INPUT_KIND_NTC },
-    /* SENSOR_PIN_ADS(1, 3) queda libre ("EXTRA") para un cableado a medida */
+    /* SENSOR_PIN_ADS(1, 3) ("EXTRA") mide los 5 V que alimentan a los sensores, con el
+     * mismo divisor 10k / 20k. Si un sensor la usa, deja de medirlos. */
 };
+
+#define REF5V_PIN        SENSOR_PIN_ADS(1, 3)
 
 /* El circuito de cada tipo de entrada */
 #define DIVISOR_5V       1.5f    /* 10k arriba, 20k abajo: 5 V -> 3,33 V */
@@ -195,6 +198,11 @@ typedef struct {
 static sensor_cfg_t s_cfg[SENSOR_COUNT];
 /* Un float de 32 bits se lee/escribe atomicamente en el P4, alcanza con volatile */
 static volatile float s_values[SENSOR_COUNT];
+/* Los sensores de presion, MAP y el TPS dan un voltaje proporcional a su alimentacion:
+ * si les llegan 4,90 V en vez de 5,00 V marcan 2 % menos. Midiendo esos 5 V se corrige. */
+static bool s_ref_on;
+static volatile float s_ref5v = NAN;   /* lo que mide, NAN si no se mide o no da */
+static float s_ref_ratio = 1.0f;       /* 5,00 / s_ref5v */
 static volatile float s_volts[SENSOR_COUNT];
 static adc_oneshot_unit_handle_t s_adc[2];
 
@@ -682,6 +690,43 @@ static void simulate(sensor_id_t id, float t)
     s_values[id] = v;
 }
 
+/* true si el sensor da un voltaje proporcional a su alimentacion (se corrige con s_ref5v) */
+static bool ratiometric(const sensor_cfg_t *c, sensor_id_t id)
+{
+    if (!c->ads) {
+        return false;           /* el ADC del ESP: bateria y temperaturas, no van con 5 V */
+    }
+    if (c->set.type == SENSOR_TYPE_LINEAL) {
+        return id == SENSOR_TPS;   /* potenciometro alimentado con los 5 V de la placa */
+    }
+    const char *u = c->curve->unit;
+    return c->curve->kind == CURVE_LINEAR && u &&
+           (!strcasecmp(u, "psi") || !strcasecmp(u, "bar") || !strcasecmp(u, "kpa_abs"));
+}
+
+static void update_ref5v(void)
+{
+    float v;
+    if (!s_ref_on || !ads_get_volts(1, 3, &v)) {
+        s_ref5v = NAN;
+        s_ref_ratio = 1.0f;
+        return;
+    }
+    v *= DIVISOR_5V;
+    if (v < 4.5f || v > 5.5f) {        /* no esta conectado o algo anda mal: no se corrige */
+        s_ref5v = isnan(s_ref5v) ? v : s_ref5v + (v - s_ref5v) * 0.1f;
+        s_ref_ratio = 1.0f;
+        return;
+    }
+    s_ref5v = isnan(s_ref5v) || s_ref5v < 4.5f || s_ref5v > 5.5f ? v : s_ref5v + (v - s_ref5v) * 0.1f;
+    s_ref_ratio = 5.0f / s_ref5v;
+}
+
+float sensors_ref5v(void)
+{
+    return s_ref5v;
+}
+
 static void sensors_task(void *arg)
 {
     (void)arg;
@@ -689,6 +734,7 @@ static void sensors_task(void *arg)
     TickType_t period = pdMS_TO_TICKS(LOOP_MS) ? pdMS_TO_TICKS(LOOP_MS) : 1;
     while (1) {
         ads_poll();            /* trae lo que convirtieron los ADS1115 y arranca lo siguiente */
+        update_ref5v();
         float t = esp_timer_get_time() / 1e6f;
         for (int i = 0; i < SENSOR_COUNT; i++) {
             sensor_cfg_t *c = &s_cfg[i];
@@ -706,7 +752,7 @@ static void sensors_task(void *arg)
                     break;
                 }
                 s_volts[i] = volts;
-                float v = analog_curve(c, i, volts);
+                float v = analog_curve(c, i, ratiometric(c, i) ? volts * s_ref_ratio : volts);
                 if (isnan(v)) break;           /* sensor desconectado: queda el ultimo valor */
                 float k = c->set.filter > 0 && c->set.filter <= 1 ? c->set.filter : 1;
                 s_values[i] = c->have_value ? s_values[i] + (v - s_values[i]) * k : v;
@@ -767,6 +813,20 @@ void sensors_start(void)
         } else if (c->src != SENSOR_SRC_OFF) {
             ESP_LOGI(TAG, "%-12s %s", s_info[i].key, src_name(c->src));
         }
+    }
+    /* Los 5 V de los sensores se miden si hay sensores que los necesitan en los ADS1115
+     * y el canal EXTRA esta libre */
+    bool want_ref = false, extra_used = false;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        const sensor_cfg_t *c = &s_cfg[i];
+        if (c->src == SENSOR_SRC_ANALOG) {
+            want_ref |= ratiometric(c, i);
+            extra_used |= c->set.gpio == REF5V_PIN;
+        }
+    }
+    s_ref_on = want_ref && !extra_used;
+    if (s_ref_on) {
+        ads_use_channel(1, 3, false);
     }
     ads_start();               /* solo busca los ADS1115 si algun sensor los usa */
     xTaskCreate(sensors_task, "sensors", 4096, NULL, 4, NULL);
