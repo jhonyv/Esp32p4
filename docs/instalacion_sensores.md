@@ -22,7 +22,7 @@ Cada valor tiene su borne fijo:
 |---|---|---|---|
 | RPM | RPM | IO2 | optoacoplador |
 | VELOCIDAD | velocidad | IO3 | optoacoplador |
-| BATERIA | batería | IO49 | divisor 100k / 10k |
+| BATERIA | batería | IO49 | divisor 47k / 10k |
 | AGUA | temperatura de agua | IO51 | NTC |
 | ACEITE T | temperatura de aceite | IO52 | NTC |
 | TURBO | turbo (MAP) | ADS1115 #1 A0 | 0-5 V |
@@ -33,7 +33,7 @@ Cada valor tiene su borne fijo:
 | EGT | temperatura de escape (con amplificador) | ADS1115 #2 A1 | 0-5 V |
 | ADMISION | temperatura de admisión | ADS1115 #2 A2 | NTC |
 | EXTRA | libre (se elige en Avanzado) | ADS1115 #2 A3 | 0-5 V |
-| CAN TX / CAN RX | ECU | IO46 / IO47 | transceptor SN65HVD230 |
+| CAN H / CAN L | ECU | ficha CAN de la pantalla | ya viene en la pantalla (TJA1051) |
 
 La placa se puede armar por partes:
 
@@ -53,7 +53,7 @@ La placa Waveshare ESP32-P4 7B tiene estos pines libres:
 
 Solo **IO49, IO51 e IO52** tienen entrada analógica. Por eso las demás analógicas van a los ADS1115.
 
-Quedan sin usar IO4 e IO5 (para una salida de shift light o botones) y IO28 a 31 e IO48. Mejor no usar IO34 ni IO36 para entradas: son pines de arranque del ESP32-P4. La ficha "C6 UART" es la conexión con el chip de WiFi y no se toca.
+Quedan sin usar IO4 e IO5 (para una salida de shift light o botones), IO28 a 31 e IO46 a 48. IO46 a 48 están en el mismo banco que la SD: su voltaje depende de cómo arranca la SD, así que mejor dejarlos para lo último. Mejor no usar IO34 ni IO36 para entradas: son pines de arranque del ESP32-P4. La ficha "C6 UART" es la conexión con el chip de WiFi y no se toca.
 
 ### Los ADS1115
 
@@ -98,7 +98,7 @@ Si el sensor es de un solo cable (hace masa por el block), la masa de la placa t
 ### Batería
 
 ```
-+12 V de contacto ──[100k]──┬──────► IO49
++12 V de contacto ──[47k]───┬──────► IO49
                             ├──[10k]──── GND
                             ├──[100nF]── GND
                             └── BAT54S a 3V3 y GND
@@ -123,15 +123,24 @@ señal ──[2,2k ½W]──┬── PC817 pata 1 (ánodo)     PC817 pata 4 (c
 
 En el menú, para RPM se elige el motor ("4 cilindros / rotativo 2 rotores", "6 cilindros"...). Para velocidad se cargan los pulsos por km.
 
+Divide por 5,7: 14,4 V llegan como 2,5 V y se lee hasta unos 17 V. Los picos más altos (arranque, alternador) los corta el BAT54S.
+
 ### CAN (ECU)
 
-Módulo SN65HVD230 (de 3,3 V):
+La pantalla ya trae el transceptor CAN, un TJA1051, en GPIO22 (TX) y GPIO21 (RX), con su propia ficha CAN de 4 pines (H y L). No hace falta ningún módulo:
 
-- 3V3 y GND.
-- CTX a IO46 y CRX a IO47.
-- CANH y CANL a la ECU, o al OBD: pin 6 CAN-H, pin 14 CAN-L.
+- CAN-H y CAN-L de la ECU a la ficha CAN de la pantalla. En el OBD: pin 6 CAN-H, pin 14 CAN-L, pines 4 y 5 masa.
+- La pantalla tiene un puente "120R" para la resistencia del bus. Con una MegaSquirt, si no llegan datos, ponerlo. En el OBD de un auto de fábrica el bus ya tiene las suyas: dejarlo sacado.
 
-El módulo trae una resistencia de 120 Ω. Con una MegaSquirt se deja. En el OBD de un auto de fábrica el bus ya tiene las suyas: si falla la lectura, sacarla.
+En Configuración > ECU, "Conexión" ya viene en "Ficha CAN de la pantalla". La opción "Transceptor externo" queda para usar otro transceptor (SN65HVD230) en dos pines libres.
+
+La pantalla también trae RS485 (GPIO27 TX, GPIO26 RX), que sirve más adelante para controladores de banda ancha o ECUs que hablan por serie.
+
+### Para que mida lo más exacto posible
+
+- Resistencias de los divisores de 0,1 %. Con las comunes de 1 % la lectura se puede correr hasta 1,3 %.
+- Un regulador de 5 V solo para los sensores, no los 5 V que alimentan la pantalla. Los sensores de presión y MAP dan un voltaje proporcional a su alimentación: si les llegan 4,90 V en vez de 5,00 V, marcan 2 % menos.
+- Masas de los sensores a la placa, y la placa al block en un solo punto.
 
 ## Tipos de sensor ya calibrados
 
@@ -158,13 +167,12 @@ Las presiones se pasan solas a la unidad de la pantalla: turbo en psi, aceite y 
 | Cantidad | Componente |
 |---|---|
 | 2 | Módulo ADS1115 (16 bits, 4 entradas) |
-| 1 | Módulo SN65HVD230 (solo si se lee la ECU) |
 | 2 | Optoacoplador PC817 |
 | 8 | Resistencia 10k (7 entradas de 0-5 V y la batería) |
 | 7 | Resistencia 20k |
+| 1 | Resistencia 47k |
 | 3 | Resistencia 1k 1 % (pull-up de las NTC) |
 | 3 | Resistencia 4,7k |
-| 1 | Resistencia 100k |
 | 2 | Resistencia 2,2k ½ W |
 | 11 | BAT54S (doble diodo Schottky) |
 | 11 | Capacitor 100 nF |

@@ -72,7 +72,7 @@ typedef struct {
 typedef enum {
     INPUT_KIND_5V = 0,    /* sensor de 0-5 V: divisor 10k arriba / 20k abajo */
     INPUT_KIND_NTC,       /* NTC a masa, pull-up de 1k a 3,3 V */
-    INPUT_KIND_BATTERY,   /* divisor 100k / 10k */
+    INPUT_KIND_BATTERY,   /* divisor 47k / 10k */
     INPUT_KIND_PULSE,     /* optoacoplador (RPM, velocidad) */
 } input_kind_t;
 

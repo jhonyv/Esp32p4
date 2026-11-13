@@ -1016,7 +1016,7 @@ static void add_analog(lv_obj_t *p, int id, sensor_setup_t *s)
         }
         add_number(p, "Filtro (1 = sin filtro)", &s->filter);
         note(p, "Divisor: voltaje en el sensor / voltaje en el pin. Bornes de 5 V de la placa: 1.5 "
-                "(10k / 20k). Bateria: 11 (100k / 10k). NTC: 1, con pull-up de 1k a 3,3 V.", TEXT_DIM);
+                "(10k / 20k). Bateria: 5.7 (47k / 10k). NTC: 1, con pull-up de 1k a 3,3 V.", TEXT_DIM);
     }
 }
 
@@ -1183,6 +1183,19 @@ static void ecu_pin_cb(lv_event_t *e)
     s_ecu_dirty = true;
 }
 
+static void ecu_wiring_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    if (lv_dropdown_get_selected(dd) == 0) {
+        s_ecu_edit.tx_gpio = ECU_CAN_TX_DEFAULT;
+        s_ecu_edit.rx_gpio = ECU_CAN_RX_DEFAULT;
+    } else {
+        s_ecu_edit.tx_gpio = s_ecu_edit.rx_gpio = -1;   /* se eligen abajo */
+    }
+    s_ecu_dirty = true;
+    lv_async_call(ecu_rebuild_async, NULL);
+}
+
 /* Todo lo que la ECU informa y esta apagado o simulado pasa a leerse de la ECU */
 static void ecu_auto_cb(lv_event_t *e)
 {
@@ -1204,8 +1217,7 @@ static void ecu_auto_cb(lv_event_t *e)
 static void ecu_save_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_ecu_edit.mode != ECU_MODE_OFF &&
-        (s_ecu_edit.tx_gpio < 0 || s_ecu_edit.rx_gpio < 0 || s_ecu_edit.tx_gpio == s_ecu_edit.rx_gpio)) {
+    if (s_ecu_edit.mode != ECU_MODE_OFF && !ecu_pins_ok(s_ecu_edit.tx_gpio, s_ecu_edit.rx_gpio)) {
         lv_label_set_text(s_ecu_status, "Elegi dos pines distintos para TX y RX");
         return;
     }
@@ -1226,17 +1238,14 @@ static void ecu_back_cb(lv_event_t *e)
 
 static lv_obj_t *ecu_pin_dropdown(lv_obj_t *parent, const char *name, int current, intptr_t which)
 {
-    char *opts = malloc(56 * 32 + 16);
+    char *opts = malloc(56 * 8 + 16);
     strcpy(opts, "(elegir)");
     uint32_t sel = 0;
     for (int i = 0; i < s_can_pin_count; i++) {
         if (s_can_pins[i] == current) {
             sel = i + 1;
         }
-        int g = s_can_pins[i];
-        sprintf(opts + strlen(opts), "\nIO%d%s", g,
-                g == ECU_CAN_TX_DEFAULT ? " (CAN TX de la placa)" :
-                g == ECU_CAN_RX_DEFAULT ? " (CAN RX de la placa)" : "");
+        sprintf(opts + strlen(opts), "\nIO%d", s_can_pins[i]);
     }
     lv_obj_t *dd = add_dropdown(parent, name, opts, sel, ecu_pin_cb);
     free(opts);
@@ -1262,12 +1271,17 @@ static void page_ecu(void)
     add_dropdown(p, "Leer la ECU", "Apagado\nOBD-II (autos de fabrica)\nMegaSquirt (MS2 / MS3 / MicroSquirt)",
                  s_ecu_edit.mode, ecu_mode_cb);
 
-    ecu_pin_dropdown(p, "Pin TX (al transceptor)", s_ecu_edit.tx_gpio, 0);
-    ecu_pin_dropdown(p, "Pin RX (del transceptor)", s_ecu_edit.rx_gpio, 1);
+    bool onboard = s_ecu_edit.tx_gpio == ECU_CAN_TX_DEFAULT && s_ecu_edit.rx_gpio == ECU_CAN_RX_DEFAULT;
+    add_dropdown(p, "Conexion", "Ficha CAN de la pantalla\nTransceptor externo (otros pines)", onboard ? 0 : 1,
+                 ecu_wiring_cb);
+    if (!onboard) {
+        ecu_pin_dropdown(p, "Pin TX (al transceptor)", s_ecu_edit.tx_gpio, 0);
+        ecu_pin_dropdown(p, "Pin RX (del transceptor)", s_ecu_edit.rx_gpio, 1);
+    }
 
     if (s_ecu_edit.mode == ECU_MODE_MEGASQUIRT) {
-        label(p, "Transceptor CAN de 3,3 V (SN65HVD230): CTX a IO46 y CRX a IO47 (ficha CAN de la placa),\n"
-                 "CANH / CANL a los cables CAN-H / CAN-L de la MegaSquirt.\n"
+        label(p, "La pantalla ya trae el transceptor CAN: los cables CAN-H y CAN-L de la MegaSquirt van a su\n"
+                 "ficha CAN (H y L). Si no llegan datos, poner el puente 120R de la pantalla (resistencia del bus).\n"
                  "En TunerStudio (firmware MS2/Extra 3.4 o mas nuevo), CAN-bus / Testmodes:\n"
                  " - CAN Parameters: velocidad 500K.\n"
                  " - Dash broadcasting = ON (ID base 1512), o bien Realtime data broadcasting = ON\n"
@@ -1275,8 +1289,8 @@ static void page_ecu(void)
                  "Grabar (Burn) y reiniciar la ECU. El formato y el ID base se detectan solos.",
               &lv_font_montserrat_14, TEXT_DIM);
     } else {
-        label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230), CTX a IO46 y CRX a IO47 (ficha CAN de la placa).\n"
-                 "Al conector OBD: pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
+        label(p, "Ficha CAN de la pantalla al conector OBD: H al pin 6, L al pin 14, masa al pin 4/5.\n"
+                 "Sin el puente 120R (el auto ya tiene las suyas). La velocidad del bus se detecta sola.",
               &lv_font_montserrat_14, TEXT_DIM);
     }
 

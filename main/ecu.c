@@ -79,7 +79,7 @@ void ecu_get_config(ecu_config_t *out)
     if (c.mode > ECU_MODE_MEGASQUIRT) {
         c.mode = ECU_MODE_OFF;
     }
-    /* Sin elegir: los de la placa de sensores (ficha CAN) */
+    /* Sin elegir: el transceptor CAN de la pantalla */
     if (c.tx_gpio < 0 && c.rx_gpio < 0) {
         c.tx_gpio = ECU_CAN_TX_DEFAULT;
         c.rx_gpio = ECU_CAN_RX_DEFAULT;
@@ -698,6 +698,14 @@ static void ecu_task(void *arg)
     }
 }
 
+bool ecu_pins_ok(int tx, int rx)
+{
+    if (tx == ECU_CAN_TX_DEFAULT && rx == ECU_CAN_RX_DEFAULT) {
+        return true;           /* el TJA1051 de la pantalla */
+    }
+    return tx >= 0 && rx >= 0 && tx != rx && sensors_gpio_ok(tx, false) && sensors_gpio_ok(rx, false);
+}
+
 void ecu_start(void)
 {
     ecu_get_config(&s_cfg);
@@ -705,8 +713,7 @@ void ecu_start(void)
     if (s_cfg.mode != ECU_MODE_OBD_CAN && s_cfg.mode != ECU_MODE_MEGASQUIRT) {
         return;
     }
-    if (s_cfg.tx_gpio < 0 || s_cfg.rx_gpio < 0 || s_cfg.tx_gpio == s_cfg.rx_gpio ||
-        !sensors_gpio_ok(s_cfg.tx_gpio, false) || !sensors_gpio_ok(s_cfg.rx_gpio, false)) {
+    if (!ecu_pins_ok(s_cfg.tx_gpio, s_cfg.rx_gpio)) {
         ESP_LOGE(TAG, "Faltan los pines TX/RX del CAN (o no sirven)");
         return;
     }
