@@ -123,6 +123,10 @@ bool sensors_enabled(sensor_id_t id);
  * pantalla de diagnostico. NAN si el sensor no es analogico. */
 float sensors_volts(sensor_id_t id);
 
+/* Los 5 V que alimentan a los sensores, medidos en el canal EXTRA (ADS1115 #2 A3).
+ * Las presiones, el MAP y el TPS se corrigen con esto. NAN si no se miden. */
+float sensors_ref5v(void);
+
 /* Para el modulo de CAN / OBD-II: carga un valor que vino de la ECU. Solo se usa si
  * ese sensor tiene fuente "ecu"; si no, se ignora. Se puede llamar desde cualquier tarea. */
 void sensors_set_ecu(sensor_id_t id, float value);

@@ -57,6 +57,7 @@ static pin_purpose_t s_pin_purpose;
 static lv_obj_t *s_pin_label;
 static lv_obj_t *s_pin_msg;
 static lv_obj_t *s_live_labels[SENSOR_COUNT];
+static lv_obj_t *s_ref_label;      /* los 5 V de los sensores, en la lista */
 static lv_obj_t *s_editor_live;
 
 static void page_main(void);
@@ -109,6 +110,7 @@ static void stop_live(void)
     }
     memset(s_live_labels, 0, sizeof(s_live_labels));
     s_editor_live = NULL;
+    s_ref_label = NULL;
     s_ecu_status = s_ecu_values = NULL;
 }
 
@@ -569,6 +571,19 @@ static void live_timer_cb(lv_timer_t *t)
             lv_label_set_text(s_live_labels[i], buf);
         }
     }
+    if (s_ref_label) {
+        float r = sensors_ref5v();
+        if (isnan(r)) {
+            lv_label_set_text(s_ref_label, "");
+        } else {
+            /* snprintf de la libc: el de LVGL no imprime decimales */
+            char txt[120];
+            snprintf(txt, sizeof(txt), r >= 4.5f && r <= 5.5f
+                     ? "5 V de los sensores: %.2f V (las presiones se corrigen con esto)"
+                     : "5 V de los sensores: %.2f V, fuera de rango: revisar el regulador de 5 V o el canal EXTRA", r);
+            lv_label_set_text(s_ref_label, txt);
+        }
+    }
     if (s_editor_live) {
         live_text(buf, sizeof(buf), s_edit_id);
         const char *problem = sensors_problem(s_edit_id);
@@ -660,6 +675,7 @@ static void page_sensors(void)
     lv_obj_t *p = new_page("SENSORES", s_dirty ? cancel_cb : back_main_cb);
     note(p, "Toca un valor para elegir de donde se lee y que sensor tenes. Los cambios se aplican "
             "al guardar (reinicia la pantalla).", TEXT_DIM);
+    s_ref_label = note(p, "", ACCENT);
     for (int i = 0; i < SENSOR_COUNT; i++) {
         lv_obj_t *btn = lv_button_create(p);
         lv_obj_set_size(btn, LV_PCT(100), LV_SIZE_CONTENT);
@@ -935,7 +951,7 @@ static void add_wiring(lv_obj_t *p, int id, sensor_setup_t *s)
             }
         }
         if (!board_name && g == SENSOR_PIN_ADS(1, 3)) {
-            board_name = "EXTRA";
+            board_name = "EXTRA, mide los 5 V";
         }
         if (g == s->gpio) {
             sel = s_pin_option_count;
