@@ -3,6 +3,7 @@
  *   CONFIGURACION
  *     Dashboard y valores    -> el menu de siempre (temas, mover valores, nombres)
  *     Sensores (con clave)   -> de donde lee cada valor, tipo de sensor, calibracion
+ *     ECU (con clave)        -> leer la ECU original por OBD-II (CAN)
  *     Clave de instalador    -> cambiarla o desactivarla (de fabrica 0000)
  *     Modo USB               -> la SD como pendrive
  *     Restablecer de fabrica -> borra todo lo guardado y reinicia
@@ -21,6 +22,7 @@
 #include "lvgl.h"
 #include "sensors.h"
 #include "usb_mode.h"
+#include "ecu.h"
 
 static const char *TAG = "settings";
 
@@ -35,7 +37,7 @@ static const char *TAG = "settings";
 __attribute__((weak)) void dashboard_set_paused(bool paused) { (void)paused; }
 __attribute__((weak)) void dashboard_menu_open(void) { }
 
-typedef enum { PIN_FOR_SENSORS, PIN_FOR_CHANGE, PIN_NEW } pin_purpose_t;
+typedef enum { PIN_FOR_SENSORS, PIN_FOR_CHANGE, PIN_NEW, PIN_FOR_ECU } pin_purpose_t;
 
 static lv_obj_t *s_scr;            /* pantalla del menu */
 static lv_obj_t *s_prev_scr;       /* la del dashboard */
@@ -45,6 +47,10 @@ static lv_timer_t *s_live_timer;
 static bool s_unlocked;            /* ya puso la clave en esta apertura */
 static bool s_dirty;               /* hay cambios de sensores sin guardar */
 static sensor_setup_t s_edit[SENSOR_COUNT];
+static ecu_config_t s_ecu_edit;
+static bool s_ecu_dirty;
+static lv_obj_t *s_ecu_status;
+static lv_obj_t *s_ecu_values;
 static int s_edit_id;
 static char s_pin_buf[5];
 static pin_purpose_t s_pin_purpose;
@@ -58,6 +64,7 @@ static void page_sensors(void);
 static void page_sensor_edit(int id);
 static void page_pin(pin_purpose_t purpose);
 static void page_pin_settings(void);
+static void page_ecu(void);
 
 /* ------------------------------------------------------------------------- */
 /* Clave                                                                      */
@@ -102,6 +109,7 @@ static void stop_live(void)
     }
     memset(s_live_labels, 0, sizeof(s_live_labels));
     s_editor_live = NULL;
+    s_ecu_status = s_ecu_values = NULL;
 }
 
 /* Borra la pagina anterior y crea una nueva con titulo y boton para volver */
@@ -241,6 +249,8 @@ void settings_open(void)
     lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
     s_unlocked = false;
     s_dirty = false;
+    s_ecu_dirty = false;
+    ecu_get_config(&s_ecu_edit);
     for (int i = 0; i < SENSOR_COUNT; i++) {
         sensors_get_setup(i, &s_edit[i]);
     }
@@ -266,6 +276,18 @@ static void sensors_cb(lv_event_t *e)
         page_sensors();
     } else {
         page_pin(PIN_FOR_SENSORS);
+    }
+}
+
+static void ecu_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on;
+    pin_get(&on);
+    if (!on || s_unlocked) {
+        page_ecu();
+    } else {
+        page_pin(PIN_FOR_ECU);
     }
 }
 
@@ -312,6 +334,8 @@ static void page_main(void)
               0x2A2A2A, display_menu_cb, NULL);
     menu_item(p, pin_on && !s_unlocked ? "Sensores  (con clave)" : "Sensores",
               "De donde lee cada valor, tipo de sensor y calibracion", 0x2A2A2A, sensors_cb, NULL);
+    menu_item(p, pin_on && !s_unlocked ? "ECU original  (con clave)" : "ECU original",
+              "Leer la computadora del auto por OBD-II (CAN)", 0x2A2A2A, ecu_cb, NULL);
     menu_item(p, "Clave de instalador", pin_on ? "Activada" : "Desactivada", 0x2A2A2A, pin_settings_cb, NULL);
     menu_item(p, "Modo USB", "La SD aparece como pendrive en la compu (reinicia)", 0x2A2A2A, usb_cb, NULL);
     lv_obj_t *f = menu_item(p, "Restablecer de fabrica",
@@ -375,6 +399,8 @@ static void pin_key_cb(lv_event_t *e)
         s_unlocked = true;
         if (s_pin_purpose == PIN_FOR_SENSORS) {
             page_sensors();
+        } else if (s_pin_purpose == PIN_FOR_ECU) {
+            page_ecu();
         } else {
             page_pin_settings();
         }
@@ -504,6 +530,11 @@ static void summary(char *buf, size_t len, const sensor_setup_t *s, sensor_id_t 
     } else if (s->src == SENSOR_SRC_PULSE) {
         snprintf(buf, len, "%s GPIO%d - %g por %s", src, s->gpio, s->pulses,
                  id == SENSOR_SPEED ? "km" : "vuelta");
+    } else if (s->src == SENSOR_SRC_ECU) {
+        ecu_status_t st;
+        ecu_get_status(&st);
+        snprintf(buf, len, "%s%s", src,
+                 st.state == ECU_STATE_CONNECTED && !ecu_supports(id) ? " - la ECU no lo informa" : "");
     } else {
         snprintf(buf, len, "%s", src);
     }
@@ -517,6 +548,9 @@ static void sensor_row_cb(lv_event_t *e)
 static void save_cb(lv_event_t *e)
 {
     (void)e;
+    if (s_ecu_dirty) {
+        ecu_save_config(&s_ecu_edit);
+    }
     if (sensors_save_setup(s_edit) == ESP_OK) {
         esp_restart();   /* la configuracion nueva se aplica al arrancar */
     }
@@ -791,4 +825,175 @@ static void page_sensor_edit(int id)
 
     s_live_timer = lv_timer_create(live_timer_cb, 250, NULL);
     live_timer_cb(NULL);
+}
+
+/* ------------------------------------------------------------------------- */
+/* ECU original (OBD-II por CAN)                                              */
+/* ------------------------------------------------------------------------- */
+
+static int s_can_pins[56];
+static int s_can_pin_count;
+
+static void ecu_live_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_ecu_status) {
+        return;
+    }
+    ecu_status_t st;
+    ecu_get_status(&st);
+    switch (st.state) {
+    case ECU_STATE_OFF:
+        lv_label_set_text(s_ecu_status, "Apagada (se activa al guardar y reiniciar)");
+        break;
+    case ECU_STATE_SEARCHING:
+        lv_label_set_text(s_ecu_status, "Buscando la ECU...  (contacto puesto? cables CAN-H / CAN-L?)");
+        break;
+    case ECU_STATE_ERROR:
+        lv_label_set_text(s_ecu_status, "No se pudo iniciar el CAN: revisa los pines TX / RX");
+        break;
+    case ECU_STATE_CONNECTED:
+        lv_label_set_text_fmt(s_ecu_status, "Conectada: %lu kbit/s, IDs de %d bits, informa %d datos, %d respuestas/s",
+                              (unsigned long)(st.bitrate / 1000), st.ext_id ? 29 : 11, st.pid_count,
+                              st.responses_per_s);
+        break;
+    }
+    /* Lo que va mandando, sensor por sensor */
+    char buf[512] = "";
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        float v;
+        if (!ecu_get_value(i, &v)) {
+            continue;
+        }
+        char val[32], line[80];
+        format_value(val, sizeof(val), i, v);
+        snprintf(line, sizeof(line), "%s: %s%s\n", sensors_info(i)->name, val,
+                 s_edit[i].src == SENSOR_SRC_ECU ? "" : "  (no se usa)");
+        strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+    }
+    lv_label_set_text(s_ecu_values, buf[0] ? buf : "Todavia no llegaron datos de la ECU.");
+}
+
+static void ecu_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    s_ecu_edit.mode = lv_obj_has_state(sw, LV_STATE_CHECKED) ? ECU_MODE_OBD_CAN : ECU_MODE_OFF;
+    s_ecu_dirty = true;
+}
+
+static void ecu_pin_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    bool is_tx = (intptr_t)lv_event_get_user_data(e) == 0;
+    uint32_t sel = lv_dropdown_get_selected(dd);
+    int8_t g = sel == 0 ? -1 : (int8_t)s_can_pins[sel - 1];
+    if (is_tx) {
+        s_ecu_edit.tx_gpio = g;
+    } else {
+        s_ecu_edit.rx_gpio = g;
+    }
+    s_ecu_dirty = true;
+}
+
+/* Todo lo que la ECU informa y esta apagado o simulado pasa a leerse de la ECU */
+static void ecu_auto_cb(lv_event_t *e)
+{
+    int n = 0;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        if (ecu_supports(i) && (s_edit[i].src == SENSOR_SRC_OFF || s_edit[i].src == SENSOR_SRC_SIM)) {
+            s_edit[i].src = SENSOR_SRC_ECU;
+            n++;
+        }
+    }
+    lv_obj_t *btn = lv_event_get_current_target(e);
+    lv_label_set_text_fmt(lv_obj_get_child(btn, 0), n ? "%d valores pasan a la ECU (falta guardar)"
+                                                      : "No hay valores nuevos para pasar", n);
+    if (n) {
+        s_dirty = true;
+    }
+}
+
+static void ecu_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ecu_edit.mode == ECU_MODE_OBD_CAN &&
+        (s_ecu_edit.tx_gpio < 0 || s_ecu_edit.rx_gpio < 0 || s_ecu_edit.tx_gpio == s_ecu_edit.rx_gpio)) {
+        lv_label_set_text(s_ecu_status, "Elegi dos pines distintos para TX y RX");
+        return;
+    }
+    bool ok = ecu_save_config(&s_ecu_edit) == ESP_OK;
+    if (ok && s_dirty) {
+        ok = sensors_save_setup(s_edit) == ESP_OK;
+    }
+    if (ok) {
+        esp_restart();
+    }
+}
+
+static void ecu_back_cb(lv_event_t *e)
+{
+    (void)e;
+    page_main();   /* lo que no se guardo queda pendiente hasta salir */
+}
+
+static lv_obj_t *ecu_pin_dropdown(lv_obj_t *parent, const char *name, int current, intptr_t which)
+{
+    char *opts = malloc(56 * 8 + 16);
+    strcpy(opts, "(elegir)");
+    uint32_t sel = 0;
+    for (int i = 0; i < s_can_pin_count; i++) {
+        if (s_can_pins[i] == current) {
+            sel = i + 1;
+        }
+        sprintf(opts + strlen(opts), "\nGPIO%d", s_can_pins[i]);
+    }
+    lv_obj_t *dd = add_dropdown(parent, name, opts, sel, ecu_pin_cb);
+    free(opts);
+    /* add_dropdown registra el callback sin dato: se reemplaza para saber si es TX o RX */
+    lv_obj_remove_event_cb(dd, ecu_pin_cb);
+    lv_obj_add_event_cb(dd, ecu_pin_cb, LV_EVENT_VALUE_CHANGED, (void *)which);
+    return dd;
+}
+
+static void page_ecu(void)
+{
+    lv_obj_t *p = new_page("ECU ORIGINAL (OBD-II)", ecu_back_cb);
+    s_can_pin_count = 0;
+    for (int g = 0; g <= 54; g++) {
+        /* Para el CAN mejor no gastar pines con ADC (quedan para sensores) */
+        if (sensors_gpio_ok(g, false) && !sensors_gpio_ok(g, true)) {
+            s_can_pins[s_can_pin_count++] = g;
+        }
+    }
+
+    s_ecu_status = label(p, "", &lv_font_montserrat_20, ACCENT);
+
+    lv_obj_t *r = row(p);
+    lv_obj_t *l = label(r, "Leer la ECU por OBD-II (CAN)", &lv_font_montserrat_22, 0xFFFFFF);
+    lv_obj_set_width(l, 400);
+    lv_obj_t *sw = lv_switch_create(r);
+    lv_obj_set_size(sw, 80, 40);
+    if (s_ecu_edit.mode == ECU_MODE_OBD_CAN) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(sw, ecu_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    ecu_pin_dropdown(p, "Pin TX (al transceptor)", s_ecu_edit.tx_gpio, 0);
+    ecu_pin_dropdown(p, "Pin RX (del transceptor)", s_ecu_edit.rx_gpio, 1);
+
+    label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230) entre estos pines y el conector OBD:\n"
+             "pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
+          &lv_font_montserrat_14, TEXT_DIM);
+
+    label(p, "Datos que manda la ECU:", &lv_font_montserrat_20, 0xFFFFFF);
+    s_ecu_values = label(p, "", &lv_font_montserrat_20, 0xFFFFFF);
+
+    lv_obj_t *r2 = row(p);
+    small_button(r2, "Usar la ECU para todo lo que informa", 0x0078A0, ecu_auto_cb, NULL);
+    small_button(r2, LV_SYMBOL_SAVE " Guardar y reiniciar", 0x1E7A1E, ecu_save_cb, NULL);
+    label(p, "Lo que la ECU no informa (por ejemplo presion de aceite) se sigue leyendo de los sensores agregados.",
+          &lv_font_montserrat_14, TEXT_DIM);
+
+    s_live_timer = lv_timer_create(ecu_live_cb, 500, NULL);
+    ecu_live_cb(NULL);
 }

@@ -15,6 +15,7 @@
 #include "sensors.h"
 #include "sd_themes.h"
 #include "usb_mode.h"
+#include "ecu.h"
 
 #define MAX_SD_THEMES 16
 
@@ -73,6 +74,8 @@ void app_main(void)
     }
     /* Sensores: cada uno lee de donde diga /sdcard/sensores.txt (sin archivo = simulados) */
     sensors_start();
+    /* ECU original por OBD-II (CAN), si esta activada en Configuracion > ECU */
+    ecu_start();
     dashboard_start(themes, theme_count);
 
     bsp_display_unlock();
