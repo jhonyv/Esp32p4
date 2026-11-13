@@ -77,6 +77,8 @@ typedef struct {
     uint8_t range_count;                         /* 0 = todos parejo de min a max */
     bool preload;               /* desde archivo: leer todos los cuadros al abrir el tema,
                                    si entran en memoria (cambian al instante) */
+    bool shift_light;           /* imagen del shift light: no sigue al sensor, aparece con las
+                                   RPM del shift light del tema (ver dash_shift_t) */
 
     /* DASH_EL_DIGITS */
     const lv_image_dsc_t *const *digit_imgs;   /* 10 imagenes: 0..9 */
@@ -93,6 +95,27 @@ typedef struct {
     bool hide_unit;
 } dash_element_t;
 
+/* Alarma de un sensor: fuera de [low, high] su valor se pone rojo y titila */
+typedef struct {
+    bool use_low, use_high;
+    float low, high;
+    float rpm_min;            /* solo avisa con las RPM por encima de esto (0 = siempre) */
+} dash_alarm_t;
+
+#define DASH_SHIFT_BORDER 0x01   /* shift light en el borde de la pantalla */
+#define DASH_SHIFT_BAR    0x02   /* la barra de RPM titila */
+#define DASH_SHIFT_IMAGE  0x04   /* una imagen o GIF (elemento FRAMES con shift_light) */
+
+/* Shift light: desde warn_rpm prende fijo (borde, o la imagen quieta en su primer cuadro),
+ * desde flash_rpm titila (borde, barra, imagen) o se anima (GIF, a fps cuadros por segundo) */
+typedef struct {
+    float warn_rpm;           /* 0 = sin aviso fijo */
+    float flash_rpm;          /* 0 = sin shift light */
+    uint32_t color;
+    uint8_t mode;             /* DASH_SHIFT_BORDER | DASH_SHIFT_BAR | DASH_SHIFT_IMAGE */
+    uint8_t fps;              /* GIF del shift light: cuadros por segundo (0 = 12) */
+} dash_shift_t;
+
 typedef struct {
     const char *name;
     uint32_t bg_color;
@@ -101,6 +124,9 @@ typedef struct {
                                  lo acomodado en la pantalla se descarta y se usa lo nuevo */
     const dash_element_t *elements;
     size_t element_count;
+    dash_alarm_t alarms[SENSOR_COUNT];
+    bool alarm_border;        /* con una alarma, el borde de la pantalla titila en rojo */
+    dash_shift_t shift;
 } dash_theme_t;
 
 /* Arranca el dashboard con la lista de temas disponibles. Llamar con el lock de
@@ -108,6 +134,14 @@ typedef struct {
  * (valores visibles, posiciones, nombres). Mantener presionado el fondo abre el
  * menu de ajustes, desde donde tambien se cambia de tema. */
 void dashboard_start(const dash_theme_t *const *themes, size_t theme_count);
+
+/* Para el menu de ajustes a pantalla completa: con paused = true deja de refrescar
+ * valores, agujas, animaciones, alarmas y shift light (no gasta tiempo detras del menu).
+ * Llamar con el lock de LVGL tomado. */
+void dashboard_set_paused(bool paused);
+
+/* Abre el menu del dashboard (valores visibles, nombres, mover valores, temas) */
+void dashboard_menu_open(void);
 
 /* Lee una imagen (PNG/JPG) con los decodificadores de LVGL y devuelve una copia
  * propia en memoria, o NULL si no se pudo. Se libera con lv_draw_buf_destroy(). */

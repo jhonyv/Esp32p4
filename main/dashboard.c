@@ -5,7 +5,6 @@
 #include <string.h>
 #include "esp_log.h"
 #include "nvs.h"
-#include "usb_mode.h"
 #include "settings.h"
 #include "src/draw/lv_image_decoder_private.h"
 #ifdef ESP_PLATFORM
@@ -28,6 +27,11 @@ static const char *TAG = "dashboard";
 #define FRAME_CACHE_MAX (12u * 1024 * 1024)   /* animaciones en memoria, entre todas */
 #define FRAME_FREE_KEEP (4u * 1024 * 1024)    /* memoria que se deja libre para lo demas */
 #define NVS_THEME_KEY   "theme_idx"
+#define ALARM_COLOR     0xFF2020
+#define ALARM_BLINK_MS  300     /* alarmas: medio ciclo del titileo */
+#define ALARM_DELAY_MS  300     /* se tiene que pasar del limite este tiempo seguido para avisar */
+#define SHIFT_BLINK_MS  80      /* shift light: titila rapido */
+#define BORDER_W        14      /* ancho del borde de la pantalla (alarmas y shift light) */
 
 typedef struct dash_item {
     dash_element_t el;      /* copia en RAM: el menu y el modo edicion cambian x/y/hidden */
@@ -49,6 +53,10 @@ typedef struct dash_item {
     struct dash_item *leader;   /* primero del grupo (o el mismo item) */
     int16_t dx0, dy0;           /* distancia al lider en el tema, sin escalar */
     uint16_t scale;             /* SCALE_100 = tamano original */
+    int8_t alarm_state;         /* VALUE: 0 normal, 1 alarma (prendido), 2 alarma (tenue), -1 revisar */
+    bool shift_off;             /* BAR de RPM: relleno apagado por el shift light.
+                                   FRAMES del shift light: imagen escondida */
+    uint32_t shift_since;       /* FRAMES del shift light: desde cuando titila (0 = no) */
 } dash_item_t;
 
 /* Lo que se guarda en NVS por cada tema */
@@ -81,6 +89,16 @@ static bool s_edit;
 static lv_obj_t *s_menu;
 static lv_obj_t *s_edit_bar;
 static dash_item_t *s_selected;     /* elemento elegido en modo edicion */
+static bool s_paused;               /* menu de ajustes abierto: no se refresca nada */
+
+/* Alarmas y shift light */
+static bool s_alarm[SENSOR_COUNT];
+static uint32_t s_alarm_since[SENSOR_COUNT];    /* desde cuando esta pasado del limite (0 = no) */
+static lv_obj_t *s_border[4];                   /* arriba, abajo, izquierda, derecha */
+static int32_t s_border_state;                  /* color que muestra, -1 = apagado */
+static lv_obj_t *s_banner;                      /* aviso de alarmas de valores que no se ven */
+static lv_obj_t *s_banner_label;
+static bool s_shift_bar_off;                    /* la barra de RPM titila: ahora apagada */
 
 static float needle_angle(const dash_element_t *el, float v)
 {
@@ -546,7 +564,7 @@ static void create_item(lv_obj_t *scr, dash_item_t *it)
             preload_frames(it);
         }
         it->shown = sensors_get(el->sensor);
-        int32_t idx = frame_index(el, it->shown);
+        int32_t idx = el->shift_light ? 0 : frame_index(el, it->shown);
         if (it->frame_cache) {
             idx = it->frame_step > 1 ? idx - idx % it->frame_step : idx;
             lv_image_set_src(it->obj, cached_frame(it, idx));
@@ -556,6 +574,7 @@ static void create_item(lv_obj_t *scr, dash_item_t *it)
             lv_image_set_src(it->obj, el->frames[idx]);
         }
         it->last_number = idx;
+        it->shift_off = el->shift_light;    /* el shift light arranca escondido */
         break;
     }
     }
@@ -597,10 +616,226 @@ static void apply_settings(void)
 {
     for (size_t i = 0; i < s_item_count; i++) {
         dash_item_t *it = &s_items[i];
-        set_hidden(it->obj, it->el.hidden);
+        set_hidden(it->obj, it->el.hidden || (it->el.shift_light && it->shift_off));
         if (it->caption_label) {
             set_hidden(it->caption_label, !s_show_names || !caption_text(it)[0]);
         }
+    }
+}
+
+/* ---------- Alarmas y shift light ---------- */
+
+static bool alarm_blink_on(void)
+{
+    return (lv_tick_get() / ALARM_BLINK_MS) % 2 == 0;
+}
+
+/* Margen para salir de la alarma, asi no parpadea cuando el valor anda justo en el limite */
+static float alarm_margin(float limit)
+{
+    float m = fabsf(limit) * 0.015f;
+    return m < 0.1f ? 0.1f : m;
+}
+
+static void alarms_update(void)
+{
+    float rpm = sensors_get(SENSOR_RPM);
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        const dash_alarm_t *a = &s_theme->alarms[i];
+        if ((!a->use_low && !a->use_high) || !sensors_enabled((sensor_id_t)i)) {
+            s_alarm[i] = false;
+            s_alarm_since[i] = 0;
+            continue;
+        }
+        float v = sensors_get((sensor_id_t)i);
+        bool on = s_alarm[i];
+        bool rpm_ok = a->rpm_min <= 0 || rpm >= a->rpm_min - (on ? 100 : 0);
+        bool out = rpm_ok &&
+                   ((a->use_high && v > a->high - (on ? alarm_margin(a->high) : 0)) ||
+                    (a->use_low && v < a->low + (on ? alarm_margin(a->low) : 0)));
+        if (!out) {
+            s_alarm[i] = false;
+            s_alarm_since[i] = 0;
+        } else if (!on) {
+            if (!s_alarm_since[i]) {
+                s_alarm_since[i] = lv_tick_get() | 1;
+            } else if (lv_tick_elaps(s_alarm_since[i]) >= ALARM_DELAY_MS) {
+                s_alarm[i] = true;
+            }
+        }
+    }
+}
+
+/* Valor rojo que titila (st 1/2) o sus colores de siempre (st 0) */
+static void set_value_alarm(dash_item_t *it, int8_t st)
+{
+    const dash_element_t *el = &it->el;
+    it->alarm_state = st;
+    if (st) {
+        lv_opa_t opa = st == 1 ? LV_OPA_COVER : LV_OPA_40;
+        lv_obj_set_style_text_color(it->value_label, lv_color_hex(ALARM_COLOR), 0);
+        lv_obj_set_style_text_opa(it->value_label, opa, 0);
+        lv_obj_set_style_text_color(it->caption_label, lv_color_hex(ALARM_COLOR), 0);
+        lv_obj_set_style_text_opa(it->caption_label, opa, 0);
+        return;
+    }
+    lv_obj_set_style_text_color(it->value_label, lv_color_hex(el->color), 0);
+    lv_obj_set_style_text_opa(it->value_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(it->caption_label, lv_color_hex(el->caption_color ? el->caption_color : el->color), 0);
+    lv_obj_set_style_text_opa(it->caption_label, el->caption_color ? LV_OPA_COVER : LV_OPA_70, 0);
+}
+
+/* El valor (con texto) de un sensor que se ve en la pantalla, o NULL */
+static dash_item_t *value_item(sensor_id_t id, bool visible_only)
+{
+    for (size_t i = 0; i < s_item_count; i++) {
+        dash_item_t *it = &s_items[i];
+        if (it->el.type == DASH_EL_VALUE && it->el.sensor == id && (!visible_only || !it->el.hidden)) {
+            return it;
+        }
+    }
+    return NULL;
+}
+
+static void border_set(bool show, uint32_t color)
+{
+    int32_t st = show ? (int32_t)(color & 0xFFFFFF) : -1;
+    if (st == s_border_state || !s_border[0]) {
+        return;
+    }
+    s_border_state = st;
+    for (int i = 0; i < 4; i++) {
+        if (show) {
+            lv_obj_set_style_bg_color(s_border[i], lv_color_hex(color), 0);
+        }
+        set_hidden(s_border[i], !show);
+    }
+}
+
+/* Cartel abajo con las alarmas de los valores que no estan en la pantalla */
+static void banner_update(void)
+{
+    char text[128] = "";
+    size_t len = 0;
+    for (int i = 0; i < SENSOR_COUNT && len < sizeof(text) - 1; i++) {
+        if (!s_alarm[i] || value_item((sensor_id_t)i, true)) {
+            continue;
+        }
+        const sensor_info_t *info = sensors_info((sensor_id_t)i);
+        dash_item_t *vi = value_item((sensor_id_t)i, false);
+        const char *name = vi ? item_name(vi) : info->name;
+        len += snprintf(text + len, sizeof(text) - len, "%s%s %.*f %s", len ? "    " : "", name,
+                        info->decimals, sensors_get((sensor_id_t)i), info->unit);
+    }
+    set_hidden(s_banner, !text[0]);
+    if (text[0] && strcmp(lv_label_get_text(s_banner_label), text) != 0) {
+        lv_label_set_text(s_banner_label, text);
+    }
+}
+
+static void overlay_update(void)
+{
+    const dash_shift_t *sh = &s_theme->shift;
+    float rpm = sensors_get(SENSOR_RPM);
+    bool flash = sh->flash_rpm > 0 && rpm >= sh->flash_rpm;
+    bool warn = sh->warn_rpm > 0 && rpm >= sh->warn_rpm;
+    bool fast_on = (lv_tick_get() / SHIFT_BLINK_MS) % 2 == 0;
+    bool any_alarm = false;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        any_alarm |= s_alarm[i];
+    }
+    if (any_alarm && s_theme->alarm_border) {
+        border_set(alarm_blink_on(), ALARM_COLOR);
+    } else if ((sh->mode & DASH_SHIFT_BORDER) && flash) {
+        border_set(fast_on, sh->color);
+    } else if ((sh->mode & DASH_SHIFT_BORDER) && warn) {
+        border_set(true, sh->color);
+    } else {
+        border_set(false, 0);
+    }
+    s_shift_bar_off = (sh->mode & DASH_SHIFT_BAR) && flash && !fast_on;
+    if (s_banner) {
+        banner_update();
+    }
+}
+
+/* Borde y cartel: arriba de todo el dashboard (el menu va por encima, en la capa superior) */
+static void create_overlay(lv_obj_t *scr)
+{
+    s_border_state = -1;
+    s_shift_bar_off = false;
+    memset(s_alarm, 0, sizeof(s_alarm));
+    memset(s_alarm_since, 0, sizeof(s_alarm_since));
+    int32_t w = lv_obj_get_width(scr), h = lv_obj_get_height(scr);
+    const int32_t pos[4][4] = {
+        { 0, 0, w, BORDER_W }, { 0, h - BORDER_W, w, BORDER_W },
+        { 0, BORDER_W, BORDER_W, h - 2 * BORDER_W }, { w - BORDER_W, BORDER_W, BORDER_W, h - 2 * BORDER_W },
+    };
+    for (int i = 0; i < 4; i++) {
+        s_border[i] = create_box(scr);
+        lv_obj_set_pos(s_border[i], pos[i][0], pos[i][1]);
+        lv_obj_set_size(s_border[i], pos[i][2], pos[i][3]);
+        lv_obj_set_style_bg_opa(s_border[i], LV_OPA_COVER, 0);
+        set_hidden(s_border[i], true);
+    }
+    s_banner = create_box(scr);
+    lv_obj_set_size(s_banner, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_banner, lv_color_hex(ALARM_COLOR), 0);
+    lv_obj_set_style_bg_opa(s_banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_banner, 10, 0);
+    lv_obj_set_style_pad_hor(s_banner, 18, 0);
+    lv_obj_set_style_pad_ver(s_banner, 8, 0);
+    lv_obj_align(s_banner, LV_ALIGN_BOTTOM_MID, 0, -(BORDER_W + 10));
+    s_banner_label = lv_label_create(s_banner);
+    lv_label_set_text(s_banner_label, "");
+    lv_obj_set_style_text_font(s_banner_label, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(s_banner_label, lv_color_white(), 0);
+    set_hidden(s_banner, true);
+}
+
+/* Imagen o GIF del shift light: aparece desde shift_aviso (quieta, en su primer cuadro) y desde
+ * shift_rpm titila (una imagen) o se anima (GIF, desde el primer cuadro). En el modo edicion se
+ * ve siempre, para poder moverla. */
+static void shift_image_update(dash_item_t *it)
+{
+    const dash_element_t *el = &it->el;
+    const dash_shift_t *sh = &s_theme->shift;
+    float rpm = sensors_get(SENSOR_RPM);
+    bool flash = !s_edit && sh->flash_rpm > 0 && rpm >= sh->flash_rpm;
+    bool show = s_edit || flash || (sh->warn_rpm > 0 && rpm >= sh->warn_rpm);
+    int32_t idx = 0;
+    if (!flash) {
+        it->shift_since = 0;
+    } else {
+        if (!it->shift_since) {
+            it->shift_since = lv_tick_get() | 1;
+        }
+        uint32_t t = lv_tick_elaps(it->shift_since);
+        if (el->frame_count > 1) {
+            uint32_t fps = sh->fps ? sh->fps : 12;
+            idx = (int32_t)(((uint64_t)t * fps / 1000) % el->frame_count);
+        } else {
+            show = (t / SHIFT_BLINK_MS) % 2 == 0;
+        }
+    }
+    if (show == it->shift_off) {
+        it->shift_off = !show;
+        set_hidden(it->obj, it->shift_off);
+    }
+    if (!show) {
+        return;
+    }
+    if (it->frame_cache && it->frame_step > 1) {
+        idx -= idx % it->frame_step;
+    }
+    if (idx == it->last_number) {
+        return;
+    }
+    if (it->frame_cache) {
+        it->last_number = idx;
+        lv_image_set_src(it->obj, cached_frame(it, idx));
+    } else if (lv_tick_elaps(it->frame_tick) >= FRAME_MIN_MS && show_file_frame(it, idx)) {
+        it->last_number = idx;
     }
 }
 
@@ -658,6 +893,10 @@ static void update_item(dash_item_t *it)
             strcpy(it->last_text, buf);
             lv_label_set_text(it->value_label, buf);
         }
+        int8_t st = s_alarm[el->sensor] ? (alarm_blink_on() ? 1 : 2) : 0;
+        if (st != it->alarm_state) {
+            set_value_alarm(it, st);
+        }
         break;
     }
 
@@ -681,6 +920,10 @@ static void update_item(dash_item_t *it)
                 lv_obj_set_size(it->fill, px, h);
             }
         }
+        if (el->sensor == SENSOR_RPM && s_shift_bar_off != it->shift_off) {
+            it->shift_off = s_shift_bar_off;    /* shift light: la barra titila */
+            set_hidden(it->fill, it->shift_off);
+        }
         if (!el->img_on && el->warn_color) {
             int8_t warn = v >= el->warn;
             if (warn != it->last_warn) {
@@ -692,6 +935,10 @@ static void update_item(dash_item_t *it)
     }
 
     case DASH_EL_FRAMES: {
+        if (el->shift_light) {
+            shift_image_update(it);
+            break;
+        }
         if (el->smoothing > 0) {
             it->shown += (v - it->shown) * el->smoothing;
             v = it->shown;
@@ -722,6 +969,8 @@ static void update_item(dash_item_t *it)
 
 static void refresh_timer_cb(lv_timer_t *t)
 {
+    alarms_update();
+    overlay_update();
     for (size_t i = 0; i < s_item_count; i++) {
         update_item(&s_items[i]);
     }
@@ -789,6 +1038,7 @@ static void apply_color(dash_item_t *it)
         if (!it->el.caption_color) {
             lv_obj_set_style_text_color(it->caption_label, lv_color_hex(it->el.color), 0);
         }
+        it->alarm_state = -1;   /* si esta en alarma, el proximo refresco lo vuelve a poner rojo */
     } else if (it->el.type == DASH_EL_BAR && !it->el.img_on) {
         lv_obj_set_style_bg_color(it->fill, lv_color_hex(it->el.bar_color), 0);
         it->last_warn = -1;     /* que el proximo refresco revise el color de alarma */
@@ -909,12 +1159,6 @@ static void create_edit_bar(void)
 
 static void menu_theme_cb(lv_event_t *e);
 static void menu_reset_cb(lv_event_t *e);
-
-static void menu_usb_cb(lv_event_t *e)
-{
-    (void)e;
-    usb_mode_request();
-}
 
 static void menu_close(void)
 {
@@ -1050,11 +1294,7 @@ static void menu_open(void)
     lv_obj_set_style_text_font(sub2, &lv_font_montserrat_16, 0);
     lv_obj_set_style_pad_top(sub2, 12, 0);
     menu_row(list, "Mostrar nombres", s_show_names, names_switch_cb, NULL);
-
-    /* Modo USB: reinicia y deja la SD como pendrive para la compu */
-    lv_obj_t *usb_btn = create_button(list, "Modo USB (cargar dashboards)", 0x2A5DB0, menu_usb_cb);
-    lv_obj_set_width(usb_btn, LV_PCT(100));
-    lv_obj_set_style_margin_top(usb_btn, 8, 0);
+    /* Modo USB y restablecer de fabrica estan en el menu de configuracion (settings.c) */
 
     lv_obj_t *buttons = create_box(s_menu);
     lv_obj_set_size(buttons, LV_PCT(100), LV_SIZE_CONTENT);
@@ -1122,11 +1362,15 @@ static void build(const dash_theme_t *theme)
     }
     apply_settings();
     create_edit_bar();
+    create_overlay(scr);
 
     lv_obj_add_event_cb(scr, screen_long_press_cb, LV_EVENT_ALL, NULL);
 
     refresh_timer_cb(NULL);
     s_timer = lv_timer_create(refresh_timer_cb, DASH_REFRESH_MS, NULL);
+    if (s_paused) {
+        lv_timer_pause(s_timer);
+    }
     ESP_LOGI(TAG, "Dashboard '%s' creado con %u elementos", theme->name, (unsigned)s_item_count);
 }
 
@@ -1153,6 +1397,9 @@ static void destroy(void)
     s_edit_bar = NULL;
     s_selected = NULL;
     s_edit = false;
+    memset(s_border, 0, sizeof(s_border));
+    s_banner = NULL;
+    s_banner_label = NULL;
 }
 
 static void save_theme_idx(void)
@@ -1205,6 +1452,25 @@ static void menu_theme_cb(lv_event_t *e)
     save_theme_idx();
     /* el boton que llamo esto se borra al reconstruir: se hace despues del evento */
     lv_async_call(switch_theme_async, NULL);
+}
+
+void dashboard_menu_open(void)
+{
+    menu_open();
+}
+
+void dashboard_set_paused(bool paused)
+{
+    s_paused = paused;
+    if (!s_timer) {
+        return;
+    }
+    if (paused) {
+        lv_timer_pause(s_timer);
+    } else {
+        lv_timer_resume(s_timer);
+        lv_timer_ready(s_timer);    /* refresca ya, sin esperar el proximo ciclo */
+    }
 }
 
 void dashboard_start(const dash_theme_t *const *themes, size_t theme_count)
