@@ -20,6 +20,10 @@
  * se detectan solos.
  * Los valores van a los sensores que tienen fuente "ECU" (sensors_set_ecu). */
 
+/* Pines de la ficha CAN en la placa de sensores */
+#define ECU_CAN_TX_DEFAULT  46
+#define ECU_CAN_RX_DEFAULT  47
+
 typedef enum {
     ECU_MODE_OFF = 0,
     ECU_MODE_OBD_CAN,

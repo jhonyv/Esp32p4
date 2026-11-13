@@ -482,7 +482,56 @@ static void page_pin_settings(void)
 /* Sensores: lista                                                            */
 /* ------------------------------------------------------------------------- */
 
-static const char *s_src_names[] = { "Apagado", "Simulado", "Analogico", "Pulsos", "ECU (CAN/OBD)" };
+static bool s_advanced;            /* el editor muestra los campos tecnicos */
+
+/* Texto chico que ocupa el ancho y se corta en renglones */
+static lv_obj_t *note(lv_obj_t *parent, const char *text, uint32_t color)
+{
+    lv_obj_t *l = label(parent, text, &lv_font_montserrat_16, color);
+    lv_obj_set_width(l, LV_PCT(100));
+    return l;
+}
+
+static bool is_pulse_sensor(int id)
+{
+    return id == SENSOR_RPM || id == SENSOR_SPEED;
+}
+
+/* Motores para la lista de RPM: pulsos por vuelta en un 4 tiempos con una chispa por
+ * cilindro (distribuidor, o la salida de tacometro de la ECU / CDI). */
+static const struct {
+    const char *label;
+    float pulses;
+} s_engines[] = {
+    { "4 cilindros / rotativo 2 rotores", 2 },
+    { "6 cilindros / rotativo 3 rotores", 3 },
+    { "8 cilindros", 4 },
+    { "3 cilindros", 1.5f },
+    { "5 cilindros", 2.5f },
+    { "2 cilindros", 1 },
+    { "1 cilindro", 0.5f },
+    { "10 cilindros", 5 },
+    { "12 cilindros", 6 },
+};
+#define ENGINE_COUNT ((int)(sizeof(s_engines) / sizeof(s_engines[0])))
+
+static int engine_index(float pulses)
+{
+    for (int i = 0; i < ENGINE_COUNT; i++) {
+        if (fabsf(s_engines[i].pulses - pulses) < 0.01f) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const char *type_name(int id, int type)
+{
+    if (type == SENSOR_TYPE_LINEAL && id == SENSOR_TPS) return "Potenciometro (se calibra con el pedal)";
+    if (type == SENSOR_TYPE_LINEAL) return "Otro sensor (cargar dos puntos)";
+    if (type == SENSOR_TYPE_NTC) return "Otra NTC (R a 25 C y beta)";
+    return sensors_type_label(type);
+}
 
 static void format_value(char *buf, size_t len, sensor_id_t id, float v)
 {
@@ -497,9 +546,13 @@ static void live_text(char *buf, size_t len, sensor_id_t id)
     char val[32];
     format_value(val, sizeof(val), id, sensors_get(id));
     float volts = sensors_volts(id);
-    if (src == SENSOR_SRC_OFF) {
+    if (sensors_problem(id)) {
+        snprintf(buf, len, "sin lectura");
+    } else if (src == SENSOR_SRC_OFF) {
         snprintf(buf, len, "-");
-    } else if (src == SENSOR_SRC_ANALOG && !isnan(volts)) {
+    } else if (src == SENSOR_SRC_ANALOG && isnan(volts)) {
+        snprintf(buf, len, "esperando...");
+    } else if (src == SENSOR_SRC_ANALOG) {
         snprintf(buf, len, "%s  (%.2f V)", val, volts);
     } else {
         snprintf(buf, len, "%s", val);
@@ -518,30 +571,66 @@ static void live_timer_cb(lv_timer_t *t)
     }
     if (s_editor_live) {
         live_text(buf, sizeof(buf), s_edit_id);
-        lv_label_set_text_fmt(s_editor_live, "Ahora: %s", buf);
+        const char *problem = sensors_problem(s_edit_id);
+        if (problem) {
+            lv_label_set_text_fmt(s_editor_live, "Ahora: sin lectura, %s", problem);
+        } else {
+            lv_label_set_text_fmt(s_editor_live, "Ahora: %s", buf);
+        }
+    }
+}
+
+/* Donde esta conectado: el borne de la placa, o el pin si es un cableado a medida */
+static void where_text(char *buf, size_t len, const sensor_setup_t *s, sensor_id_t id)
+{
+    const sensor_input_t *in = sensors_board_input(id);
+    if (in && sensors_uses_board_input(id, s)) {
+        snprintf(buf, len, "borne %s", in->name);
+    } else {
+        char pin[24];
+        sensors_pin_name(s->gpio, pin, sizeof(pin));
+        snprintf(buf, len, "a medida en %s", pin);
     }
 }
 
 static void summary(char *buf, size_t len, const sensor_setup_t *s, sensor_id_t id)
 {
-    const char *src = s->src < 5 ? s_src_names[s->src] : "?";
-    if (s->src == SENSOR_SRC_ANALOG) {
-        snprintf(buf, len, "%s GPIO%d - %s", src, s->gpio, sensors_type_label(s->type));
-    } else if (s->src == SENSOR_SRC_PULSE) {
-        snprintf(buf, len, "%s GPIO%d - %g por %s", src, s->gpio, s->pulses,
-                 id == SENSOR_SPEED ? "km" : "vuelta");
-    } else if (s->src == SENSOR_SRC_ECU) {
+    char where[40];
+    switch (s->src) {
+    case SENSOR_SRC_ANALOG:
+        where_text(where, sizeof(where), s, id);
+        snprintf(buf, len, "Sensor, %s - %s", where, type_name(id, s->type));
+        break;
+    case SENSOR_SRC_PULSE: {
+        where_text(where, sizeof(where), s, id);
+        int e = engine_index(s->pulses);
+        if (id == SENSOR_RPM && e >= 0) {
+            snprintf(buf, len, "Sensor, %s - %s", where, s_engines[e].label);
+        } else {
+            snprintf(buf, len, "Sensor, %s - %g pulsos por %s", where, s->pulses,
+                     id == SENSOR_SPEED ? "km" : "vuelta");
+        }
+        break;
+    }
+    case SENSOR_SRC_ECU: {
         ecu_status_t st;
         ecu_get_status(&st);
-        snprintf(buf, len, "%s%s", src,
+        snprintf(buf, len, "ECU%s",
                  st.state == ECU_STATE_CONNECTED && !ecu_supports(id) ? " - la ECU no lo informa" : "");
-    } else {
-        snprintf(buf, len, "%s", src);
+        break;
+    }
+    case SENSOR_SRC_SIM:
+        snprintf(buf, len, "Simulado (demo)");
+        break;
+    default:
+        snprintf(buf, len, "Apagado");
+        break;
     }
 }
 
 static void sensor_row_cb(lv_event_t *e)
 {
+    s_advanced = false;
     page_sensor_edit((int)(intptr_t)lv_event_get_user_data(e));
 }
 
@@ -569,8 +658,8 @@ static void cancel_cb(lv_event_t *e)
 static void page_sensors(void)
 {
     lv_obj_t *p = new_page("SENSORES", s_dirty ? cancel_cb : back_main_cb);
-    label(p, "Toca un sensor para configurarlo. Los cambios se aplican al guardar (reinicia la pantalla).",
-          &lv_font_montserrat_16, TEXT_DIM);
+    note(p, "Toca un valor para elegir de donde se lee y que sensor tenes. Los cambios se aplican "
+            "al guardar (reinicia la pantalla).", TEXT_DIM);
     for (int i = 0; i < SENSOR_COUNT; i++) {
         lv_obj_t *btn = lv_button_create(p);
         lv_obj_set_size(btn, LV_PCT(100), LV_SIZE_CONTENT);
@@ -600,8 +689,11 @@ static void page_sensors(void)
 /* Sensores: editor de uno                                                    */
 /* ------------------------------------------------------------------------- */
 
-static int s_gpio_options[56];
-static int s_gpio_option_count;
+/* Lo que ofrece cada lista (el indice del dropdown -> el valor de verdad) */
+static uint8_t s_src_options[4];
+static int s_pin_options[40];
+static int s_pin_option_count;
+static uint8_t s_type_options[32];
 
 static void editor_back_cb(lv_event_t *e)
 {
@@ -617,33 +709,64 @@ static void rebuild_async(void *arg)
     }
 }
 
+static void rebuild(void)
+{
+    lv_async_call(rebuild_async, NULL);   /* cambian los campos que se muestran */
+}
+
 static void src_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
     sensor_setup_t *s = &s_edit[s_edit_id];
-    s->src = (uint8_t)lv_dropdown_get_selected(dd);
-    /* Si el pin elegido no sirve para la fuente nueva, se saca */
-    if (s->gpio >= 0 && !sensors_gpio_ok(s->gpio, s->src == SENSOR_SRC_ANALOG)) {
-        s->gpio = -1;
+    s->src = s_src_options[lv_dropdown_get_selected(dd)];
+    /* Sensor en la placa: si el pin que tenia no sirve, va a su entrada fija */
+    if ((s->src == SENSOR_SRC_ANALOG || s->src == SENSOR_SRC_PULSE) &&
+        !sensors_gpio_ok(s->gpio, s->src == SENSOR_SRC_ANALOG)) {
+        sensors_apply_board_input(s_edit_id, s);
     }
     s_dirty = true;
-    lv_async_call(rebuild_async, NULL);   /* cambian los campos que se muestran */
+    rebuild();
 }
 
-static void gpio_cb(lv_event_t *e)
+static void pin_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
-    uint32_t sel = lv_dropdown_get_selected(dd);
-    s_edit[s_edit_id].gpio = sel == 0 ? -1 : (int8_t)s_gpio_options[sel - 1];
+    s_edit[s_edit_id].gpio = (int8_t)s_pin_options[lv_dropdown_get_selected(dd)];
     s_dirty = true;
+    rebuild();
+}
+
+static void board_input_cb(lv_event_t *e)
+{
+    (void)e;
+    sensors_apply_board_input(s_edit_id, &s_edit[s_edit_id]);
+    s_dirty = true;
+    rebuild();
+}
+
+static void advanced_cb(lv_event_t *e)
+{
+    (void)e;
+    s_advanced = !s_advanced;
+    rebuild();
 }
 
 static void type_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
-    s_edit[s_edit_id].type = (uint8_t)lv_dropdown_get_selected(dd);
+    s_edit[s_edit_id].type = s_type_options[lv_dropdown_get_selected(dd)];
     s_dirty = true;
-    lv_async_call(rebuild_async, NULL);
+    rebuild();
+}
+
+static void engine_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint32_t sel = lv_dropdown_get_selected(dd);
+    if (sel < ENGINE_COUNT) {
+        s_edit[s_edit_id].pulses = s_engines[sel].pulses;
+        s_dirty = true;
+    }
 }
 
 static void edge_cb(lv_event_t *e)
@@ -651,6 +774,26 @@ static void edge_cb(lv_event_t *e)
     lv_obj_t *dd = lv_event_get_target(e);
     s_edit[s_edit_id].edge_rising = lv_dropdown_get_selected(dd) == 1;
     s_dirty = true;
+}
+
+/* Acelerador: toma el voltaje de ahora como "suelto" (0 %) o "a fondo" (100 %) */
+static void tps_capture_cb(lv_event_t *e)
+{
+    bool full = (intptr_t)lv_event_get_user_data(e) != 0;
+    float v = sensors_volts(SENSOR_TPS);
+    if (isnan(v)) {
+        return;
+    }
+    sensor_setup_t *s = &s_edit[SENSOR_TPS];
+    if (full) {
+        s->v2 = roundf(v * 100) / 100;
+        s->val2 = 100;
+    } else {
+        s->v1 = roundf(v * 100) / 100;
+        s->val1 = 0;
+    }
+    s_dirty = true;
+    rebuild();
 }
 
 static void number_changed_cb(lv_event_t *e)
@@ -686,7 +829,7 @@ static void number_focus_cb(lv_event_t *e)
     lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
 
-static void add_number(lv_obj_t *parent, const char *name, float *ptr)
+static lv_obj_t *add_number(lv_obj_t *parent, const char *name, float *ptr)
 {
     lv_obj_t *r = row(parent);
     lv_obj_t *l = label(r, name, &lv_font_montserrat_20, 0xFFFFFF);
@@ -702,6 +845,7 @@ static void add_number(lv_obj_t *parent, const char *name, float *ptr)
     lv_obj_set_style_text_font(ta, &lv_font_montserrat_22, 0);
     lv_obj_add_event_cb(ta, number_changed_cb, LV_EVENT_VALUE_CHANGED, ptr);
     lv_obj_add_event_cb(ta, number_focus_cb, LV_EVENT_FOCUSED, NULL);
+    return r;
 }
 
 static lv_obj_t *add_dropdown(lv_obj_t *parent, const char *name, const char *options, uint32_t sel,
@@ -722,6 +866,192 @@ static lv_obj_t *add_dropdown(lv_obj_t *parent, const char *name, const char *op
     return dd;
 }
 
+/* Fuente: Apagado / Sensor en la placa / ECU / Simulado */
+static void add_source(lv_obj_t *p, int id, sensor_setup_t *s)
+{
+    uint8_t sensor_src = is_pulse_sensor(id) ? SENSOR_SRC_PULSE : SENSOR_SRC_ANALOG;
+    const uint8_t order[4] = { SENSOR_SRC_OFF, sensor_src, SENSOR_SRC_ECU, SENSOR_SRC_SIM };
+    if (s->src != SENSOR_SRC_OFF && s->src != sensor_src && s->src != SENSOR_SRC_ECU &&
+        s->src != SENSOR_SRC_SIM) {
+        s->src = SENSOR_SRC_OFF;       /* por ejemplo "pulsos" en un sensor analogico */
+    }
+    uint32_t sel = 0;
+    for (int i = 0; i < 4; i++) {
+        s_src_options[i] = order[i];
+        if (order[i] == s->src) {
+            sel = i;
+        }
+    }
+    add_dropdown(p, "Se lee de", "Apagado\nUn sensor en la placa\nLa ECU (CAN / OBD-II)\nSimulado (demo)",
+                 sel, src_cb);
+}
+
+/* Donde va conectado. En modo simple solo lo dice; en Avanzado se puede cambiar. */
+static void add_wiring(lv_obj_t *p, int id, sensor_setup_t *s)
+{
+    bool analog = s->src == SENSOR_SRC_ANALOG;
+    const sensor_input_t *in = sensors_board_input(id);
+    bool board = in && sensors_uses_board_input(id, s);
+    char buf[160], pin[24];
+    sensors_pin_name(s->gpio, pin, sizeof(pin));
+    if (board) {
+        snprintf(buf, sizeof(buf), "Se conecta en el borne %s de la placa (%s).", in->name, pin);
+        note(p, buf, 0xFFFFFF);
+    } else {
+        bool ntc = s->type == SENSOR_TYPE_NTC || strstr(sensors_type_label(s->type), "NTC") != NULL;
+        if (s->src == SENSOR_SRC_PULSE) {
+            snprintf(buf, sizeof(buf), "Cableado a medida: %s, flanco de %s.", pin,
+                     s->edge_rising ? "subida" : "bajada");
+        } else if (ntc) {
+            snprintf(buf, sizeof(buf), "Cableado a medida: %s, divisor %g, pull-up de %g ohms a %g V.", pin,
+                     s->divisor, s->pullup, s->vpullup);
+        } else {
+            snprintf(buf, sizeof(buf), "Cableado a medida: %s, divisor %g.", pin, s->divisor);
+        }
+        note(p, buf, ACCENT);
+        if (in) {
+            lv_obj_t *r = row(p);
+            snprintf(buf, sizeof(buf), "Usar el borne %s de la placa", in->name);
+            small_button(r, buf, 0x0078A0, board_input_cb, NULL);
+        }
+    }
+    if (!s_advanced) {
+        return;
+    }
+    /* Todas las entradas que sirven, con el nombre del borne si es de la placa */
+    char *opts = malloc(40 * 32);
+    opts[0] = 0;
+    s_pin_option_count = 0;
+    uint32_t sel = 0;
+    for (int g = 0; g < 108 && s_pin_option_count < 40; g++) {
+        if (!sensors_gpio_ok(g, analog)) {
+            continue;
+        }
+        const char *board_name = NULL;
+        for (int k = 0; k < SENSOR_COUNT; k++) {
+            const sensor_input_t *bi = sensors_board_input(k);
+            if (bi && bi->pin == g) {
+                board_name = bi->name;
+            }
+        }
+        if (!board_name && g == SENSOR_PIN_ADS(1, 3)) {
+            board_name = "EXTRA";
+        }
+        if (g == s->gpio) {
+            sel = s_pin_option_count;
+        }
+        s_pin_options[s_pin_option_count++] = g;
+        sensors_pin_name(g, pin, sizeof(pin));
+        sprintf(opts + strlen(opts), "%s%s%s%s%s", opts[0] ? "\n" : "", pin,
+                board_name ? " (" : "", board_name ? board_name : "", board_name ? ")" : "");
+    }
+    if (s_pin_option_count) {
+        add_dropdown(p, "Entrada", opts, sel, pin_cb);
+    }
+    free(opts);
+}
+
+static void add_type_list(lv_obj_t *p, int id, sensor_setup_t *s)
+{
+    char *opts = malloc(1600);
+    opts[0] = 0;
+    int n = 0;
+    uint32_t sel = 0;
+    for (int t = 0; t < sensors_type_count() && n < (int)sizeof(s_type_options); t++) {
+        /* La lista corta solo tiene los que sirven para este valor (y el que ya estaba) */
+        if (!s_advanced && !sensors_type_fits(id, t) && t != s->type) {
+            continue;
+        }
+        if (t == s->type) {
+            sel = n;
+        }
+        s_type_options[n++] = t;
+        if (opts[0]) strcat(opts, "\n");
+        strcat(opts, type_name(id, t));
+    }
+    add_dropdown(p, "Que sensor tenes", opts, sel, type_cb);
+    free(opts);
+}
+
+static void add_analog(lv_obj_t *p, int id, sensor_setup_t *s)
+{
+    const sensor_info_t *info = sensors_info(id);
+    add_type_list(p, id, s);
+    bool ntc = s->type == SENSOR_TYPE_NTC || strstr(sensors_type_label(s->type), "NTC") != NULL;
+
+    if (s->type == SENSOR_TYPE_LINEAL && id == SENSOR_TPS) {
+        add_number(p, "Voltaje sin acelerar (V)", &s->v1);
+        add_number(p, "Voltaje a fondo (V)", &s->v2);
+        s->val1 = 0;
+        s->val2 = 100;
+        if (sensors_source(SENSOR_TPS) == SENSOR_SRC_ANALOG) {
+            lv_obj_t *r = row(p);
+            small_button(r, "Tomar: pie suelto", 0x0078A0, tps_capture_cb, (void *)0);
+            small_button(r, "Tomar: a fondo", 0x0078A0, tps_capture_cb, (void *)1);
+            note(p, "Con el motor apagado y el contacto puesto: pie suelto, tocar el primero; "
+                    "pisar a fondo, tocar el segundo.", TEXT_DIM);
+        } else {
+            note(p, "Para calibrarlo con el pedal: guardar, volver a entrar y usar los botones \"Tomar\".",
+                 TEXT_DIM);
+        }
+    } else if (s->type == SENSOR_TYPE_LINEAL) {
+        char name[48];
+        note(p, "Sacalo de la hoja del sensor: dos voltajes y lo que marca con cada uno.", TEXT_DIM);
+        add_number(p, "Voltaje 1 (V)", &s->v1);
+        snprintf(name, sizeof(name), "Valor con voltaje 1 (%s)", info->unit);
+        add_number(p, name, &s->val1);
+        add_number(p, "Voltaje 2 (V)", &s->v2);
+        snprintf(name, sizeof(name), "Valor con voltaje 2 (%s)", info->unit);
+        add_number(p, name, &s->val2);
+    }
+    if (s->type == SENSOR_TYPE_NTC) {
+        add_number(p, "R a 25 C (ohms)", &s->r25);
+        add_number(p, "Beta", &s->beta);
+    }
+    if (s_advanced) {
+        add_number(p, "Divisor de la entrada", &s->divisor);
+        if (ntc) {
+            add_number(p, "Resistencia pull-up (ohms)", &s->pullup);
+            add_number(p, "Pull-up conectada a (V)", &s->vpullup);
+        }
+        add_number(p, "Filtro (1 = sin filtro)", &s->filter);
+        note(p, "Divisor: voltaje en el sensor / voltaje en el pin. Bornes de 5 V de la placa: 1.5 "
+                "(10k / 20k). Bateria: 11 (100k / 10k). NTC: 1, con pull-up de 1k a 3,3 V.", TEXT_DIM);
+    }
+}
+
+static void add_pulses(lv_obj_t *p, int id, sensor_setup_t *s)
+{
+    if (id == SENSOR_RPM) {
+        int e = engine_index(s->pulses);
+        char *opts = malloc(512);
+        opts[0] = 0;
+        for (int i = 0; i < ENGINE_COUNT; i++) {
+            if (i) strcat(opts, "\n");
+            strcat(opts, s_engines[i].label);
+        }
+        if (e < 0) {
+            sprintf(opts + strlen(opts), "\nOtro: %g pulsos por vuelta", s->pulses);
+            e = ENGINE_COUNT;
+        }
+        add_dropdown(p, "Motor", opts, e, engine_cb);
+        free(opts);
+        note(p, "Motor de 4 tiempos con distribuidor, o la salida de tacometro de la ECU / CDI. "
+                "Si marca el doble o la mitad, en Avanzado cambia los pulsos por vuelta. "
+                "Nunca conectar la bobina directo: siempre por el borne RPM de la placa.", TEXT_DIM);
+    } else {
+        add_number(p, "Pulsos por km", &s->pulses);
+        note(p, "Si marca de mas o de menos: pulsos nuevos = pulsos x velocidad que marca / velocidad real "
+                "(con GPS o el velocimetro).", TEXT_DIM);
+    }
+    if (s_advanced) {
+        if (id == SENSOR_RPM) {
+            add_number(p, "Pulsos por vuelta", &s->pulses);
+        }
+        add_dropdown(p, "Flanco", "Bajada (optoacoplador de la placa)\nSubida", s->edge_rising ? 1 : 0, edge_cb);
+    }
+}
+
 static void page_sensor_edit(int id)
 {
     s_edit_id = id;
@@ -732,89 +1062,30 @@ static void page_sensor_edit(int id)
     lv_obj_t *p = new_page(title, editor_back_cb);
 
     s_editor_live = label(p, "", &lv_font_montserrat_20, ACCENT);
-    label(p, "(\"Ahora\" es con la configuracion guardada; lo nuevo se ve al guardar)",
-          &lv_font_montserrat_14, TEXT_DIM);
+    lv_obj_set_width(s_editor_live, LV_PCT(100));
+    note(p, "(\"Ahora\" es con la configuracion guardada; lo nuevo se ve al guardar)", TEXT_DIM);
 
-    /* Fuente: los pulsos solo tienen sentido para RPM y velocidad */
-    bool pulse_ok = id == SENSOR_RPM || id == SENSOR_SPEED;
-    if (s->src == SENSOR_SRC_PULSE && !pulse_ok) {
-        s->src = SENSOR_SRC_OFF;
-    }
-    add_dropdown(p, "Fuente", pulse_ok ? "Apagado\nSimulado\nAnalogico\nPulsos\nECU (CAN/OBD)"
-                                       : "Apagado\nSimulado\nAnalogico\n-\nECU (CAN/OBD)",
-                 s->src, src_cb);
+    add_source(p, id, s);
 
     if (s->src == SENSOR_SRC_ANALOG || s->src == SENSOR_SRC_PULSE) {
-        bool analog = s->src == SENSOR_SRC_ANALOG;
-        char *opts = malloc(56 * 8 + 16);
-        strcpy(opts, "(elegir)");
-        s_gpio_option_count = 0;
-        uint32_t sel = 0;
-        for (int g = 0; g <= 54; g++) {
-            if (!sensors_gpio_ok(g, analog)) {
-                continue;
-            }
-            s_gpio_options[s_gpio_option_count++] = g;
-            if (g == s->gpio) {
-                sel = s_gpio_option_count;
-            }
-            sprintf(opts + strlen(opts), "\nGPIO%d", g);
+        add_wiring(p, id, s);
+        if (s->src == SENSOR_SRC_ANALOG) {
+            add_analog(p, id, s);
+        } else {
+            add_pulses(p, id, s);
         }
-        add_dropdown(p, "Entrada", opts, sel, gpio_cb);
-        free(opts);
-    }
-
-    if (s->src == SENSOR_SRC_ANALOG) {
-        /* Lista de tipos de sensor */
-        size_t len = 0;
-        for (int i = 0; i < sensors_type_count(); i++) {
-            len += strlen(sensors_type_label(i)) + 1;
-        }
-        char *opts = malloc(len + 1);
-        opts[0] = 0;
-        for (int i = 0; i < sensors_type_count(); i++) {
-            if (i) strcat(opts, "\n");
-            strcat(opts, sensors_type_label(i));
-        }
-        add_dropdown(p, "Tipo de sensor", opts, s->type, type_cb);
-        free(opts);
-
-        const char *type = sensors_type_label(s->type);
-        bool ntc = s->type == SENSOR_TYPE_NTC || strstr(type, "NTC") != NULL;
-        if (s->type == SENSOR_TYPE_LINEAL) {
-            char name[48];
-            add_number(p, "Voltaje 1 (V)", &s->v1);
-            snprintf(name, sizeof(name), "Valor con voltaje 1 (%s)", info->unit);
-            add_number(p, name, &s->val1);
-            add_number(p, "Voltaje 2 (V)", &s->v2);
-            snprintf(name, sizeof(name), "Valor con voltaje 2 (%s)", info->unit);
-            add_number(p, name, &s->val2);
-        }
-        if (ntc) {
-            add_number(p, "Resistencia pull-up (ohms)", &s->pullup);
-            add_number(p, "Pull-up conectada a (V)", &s->vpullup);
-        }
-        if (s->type == SENSOR_TYPE_NTC) {
-            add_number(p, "R a 25 C (ohms)", &s->r25);
-            add_number(p, "Beta", &s->beta);
-        }
-        add_number(p, "Divisor de la entrada", &s->divisor);
-        add_number(p, "Filtro (1 = sin filtro)", &s->filter);
-        label(p, "Divisor: con 10k arriba y 20k abajo es 1.5; la bateria con 100k/10k es 11.\n"
-                 "Las NTC van directo al pin (divisor 1) con la pull-up a 3,3 V.",
-              &lv_font_montserrat_14, TEXT_DIM);
-    } else if (s->src == SENSOR_SRC_PULSE) {
-        add_number(p, id == SENSOR_SPEED ? "Pulsos por km" : "Pulsos por vuelta (4 cil. = 2)", &s->pulses);
-        add_dropdown(p, "Flanco", "Bajada (optoacoplador)\nSubida", s->edge_rising ? 1 : 0, edge_cb);
-        label(p, "RPM: nunca conectar la bobina directo, siempre con optoacoplador o modulo de tacometro.",
-              &lv_font_montserrat_14, TEXT_DIM);
     } else if (s->src == SENSOR_SRC_ECU) {
-        label(p, "La lectura de la ECU por CAN / OBD-II todavia esta en desarrollo.",
-              &lv_font_montserrat_16, TEXT_DIM);
+        note(p, "Se configura en Configuracion > ECU. Si la ECU no informa este valor, conviene "
+                "leerlo de un sensor en la placa.", TEXT_DIM);
+    } else if (s->src == SENSOR_SRC_SIM) {
+        note(p, "Valores inventados que se mueven solos, para mostrar la pantalla sin auto.", TEXT_DIM);
     }
 
     lv_obj_t *r = row(p);
     small_button(r, "Listo", 0x0078A0, editor_back_cb, NULL);
+    if (s->src == SENSOR_SRC_ANALOG || s->src == SENSOR_SRC_PULSE) {
+        small_button(r, s_advanced ? "Ocultar avanzado" : "Avanzado (instaladores)", 0x3A3A3A, advanced_cb, NULL);
+    }
 
     s_kb = lv_keyboard_create(s_scr);
     lv_keyboard_set_mode(s_kb, LV_KEYBOARD_MODE_NUMBER);
@@ -955,14 +1226,17 @@ static void ecu_back_cb(lv_event_t *e)
 
 static lv_obj_t *ecu_pin_dropdown(lv_obj_t *parent, const char *name, int current, intptr_t which)
 {
-    char *opts = malloc(56 * 8 + 16);
+    char *opts = malloc(56 * 32 + 16);
     strcpy(opts, "(elegir)");
     uint32_t sel = 0;
     for (int i = 0; i < s_can_pin_count; i++) {
         if (s_can_pins[i] == current) {
             sel = i + 1;
         }
-        sprintf(opts + strlen(opts), "\nGPIO%d", s_can_pins[i]);
+        int g = s_can_pins[i];
+        sprintf(opts + strlen(opts), "\nIO%d%s", g,
+                g == ECU_CAN_TX_DEFAULT ? " (CAN TX de la placa)" :
+                g == ECU_CAN_RX_DEFAULT ? " (CAN RX de la placa)" : "");
     }
     lv_obj_t *dd = add_dropdown(parent, name, opts, sel, ecu_pin_cb);
     free(opts);
@@ -992,7 +1266,8 @@ static void page_ecu(void)
     ecu_pin_dropdown(p, "Pin RX (del transceptor)", s_ecu_edit.rx_gpio, 1);
 
     if (s_ecu_edit.mode == ECU_MODE_MEGASQUIRT) {
-        label(p, "Transceptor CAN de 3,3 V (SN65HVD230) a los cables CAN-H / CAN-L de la MegaSquirt.\n"
+        label(p, "Transceptor CAN de 3,3 V (SN65HVD230): CTX a IO46 y CRX a IO47 (ficha CAN de la placa),\n"
+                 "CANH / CANL a los cables CAN-H / CAN-L de la MegaSquirt.\n"
                  "En TunerStudio (firmware MS2/Extra 3.4 o mas nuevo), CAN-bus / Testmodes:\n"
                  " - CAN Parameters: velocidad 500K.\n"
                  " - Dash broadcasting = ON (ID base 1512), o bien Realtime data broadcasting = ON\n"
@@ -1000,8 +1275,8 @@ static void page_ecu(void)
                  "Grabar (Burn) y reiniciar la ECU. El formato y el ID base se detectan solos.",
               &lv_font_montserrat_14, TEXT_DIM);
     } else {
-        label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230) entre estos pines y el conector OBD:\n"
-                 "pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
+        label(p, "Conexion: transceptor CAN de 3,3 V (SN65HVD230), CTX a IO46 y CRX a IO47 (ficha CAN de la placa).\n"
+                 "Al conector OBD: pin 6 = CAN-H, pin 14 = CAN-L, pin 4/5 = masa. La velocidad del bus se detecta sola.",
               &lv_font_montserrat_14, TEXT_DIM);
     }
 

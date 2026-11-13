@@ -15,6 +15,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "ads1115.h"
 
 static const char *TAG = "sensors";
 
@@ -39,6 +40,36 @@ static const sensor_info_t s_info[SENSOR_COUNT] = {
     [SENSOR_TPS]        = { "tps",         "ACELERADOR",  "%",    0 },
     [SENSOR_EGT]        = { "egt",         "EGT",         "\xC2\xB0" "C", 0 },
 };
+
+/* Entrada fija de cada valor en la placa de sensores. Los nombres son los que van
+ * impresos al lado de cada borne. Ver docs/instalacion_sensores.md. */
+static const sensor_input_t s_inputs[SENSOR_COUNT] = {
+    [SENSOR_RPM]        = { "RPM",        2,                     INPUT_KIND_PULSE },
+    [SENSOR_SPEED]      = { "VELOCIDAD",  3,                     INPUT_KIND_PULSE },
+    [SENSOR_BATTERY]    = { "BATERIA",    49,                    INPUT_KIND_BATTERY },
+    [SENSOR_WATER_TEMP] = { "AGUA",       51,                    INPUT_KIND_NTC },
+    [SENSOR_OIL_TEMP]   = { "ACEITE T",   52,                    INPUT_KIND_NTC },
+    [SENSOR_BOOST]      = { "TURBO",      SENSOR_PIN_ADS(0, 0),  INPUT_KIND_5V },
+    [SENSOR_OIL_PRESS]  = { "ACEITE P",   SENSOR_PIN_ADS(0, 1),  INPUT_KIND_5V },
+    [SENSOR_FUEL_PRESS] = { "NAFTA P",    SENSOR_PIN_ADS(0, 2),  INPUT_KIND_5V },
+    [SENSOR_AFR]        = { "AFR",        SENSOR_PIN_ADS(0, 3),  INPUT_KIND_5V },
+    [SENSOR_TPS]        = { "TPS",        SENSOR_PIN_ADS(1, 0),  INPUT_KIND_5V },
+    [SENSOR_EGT]        = { "EGT",        SENSOR_PIN_ADS(1, 1),  INPUT_KIND_5V },
+    [SENSOR_IAT]        = { "ADMISION",   SENSOR_PIN_ADS(1, 2),  INPUT_KIND_NTC },
+    /* SENSOR_PIN_ADS(1, 3) queda libre ("EXTRA") para un cableado a medida */
+};
+
+/* El circuito de cada tipo de entrada */
+#define DIVISOR_5V       1.5f    /* 10k arriba, 20k abajo: 5 V -> 3,33 V */
+#define DIVISOR_BATTERY  11.0f   /* 100k arriba, 10k abajo */
+#define NTC_PULLUP       1000.0f /* 1k a 3,3 V: buena resolucion entre 60 y 130 C */
+#define NTC_VPULLUP      3.3f
+
+/* Se leen mas seguido (cambian rapido) */
+static bool fast_sensor(sensor_id_t id)
+{
+    return id == SENSOR_BOOST || id == SENSOR_TPS;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Curvas: como se pasa de voltios a valor                                    */
@@ -105,8 +136,12 @@ static const curve_preset_t s_presets[] = {
 };
 
 #define PRESET_COUNT    ((int)(sizeof(s_presets) / sizeof(s_presets[0])))
-#define TYPE_VOLTS      12
-#define TYPE_NTC_BOSCH  13
+#define TYPE_PRESS_100PSI   2
+#define TYPE_MAP_3BAR       6
+#define TYPE_WIDEBAND_10_20 8
+#define TYPE_EGT_5MV        11
+#define TYPE_VOLTS          12
+#define TYPE_NTC_BOSCH      13
 
 /* Pasa una presion entre psi, bar y kPa absolutos. Lo demas queda igual. */
 static bool pressure_to_kpa(const char *unit, float v, float *kpa)
@@ -151,6 +186,8 @@ typedef struct {
     adc_unit_t unit;
     adc_channel_t chan;
     adc_cali_handle_t cali;
+    bool ads;                  /* entrada de un ADS1115 en vez del ADC del ESP */
+    int8_t ads_chip, ads_ch;
     bool have_value;
     pulse_t pulse;
 } sensor_cfg_t;
@@ -266,6 +303,14 @@ static float analog_curve(const sensor_cfg_t *c, sensor_id_t id, float volts)
 
 static bool analog_read_volts(sensor_cfg_t *c, float *out)
 {
+    if (c->ads) {
+        float v;
+        if (!ads_get_volts(c->ads_chip, c->ads_ch, &v)) {
+            return false;
+        }
+        *out = v * c->set.divisor;
+        return true;
+    }
     int sum = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
         int raw = 0;
@@ -285,6 +330,13 @@ static bool analog_read_volts(sensor_cfg_t *c, float *out)
 
 static bool analog_setup(sensor_cfg_t *c, sensor_id_t id)
 {
+    if (SENSOR_PIN_IS_ADS(c->set.gpio)) {
+        c->ads = true;
+        c->ads_chip = SENSOR_PIN_ADS_CHIP(c->set.gpio);
+        c->ads_ch = SENSOR_PIN_ADS_CH(c->set.gpio);
+        ads_use_channel(c->ads_chip, c->ads_ch, fast_sensor(id));
+        return true;
+    }
     if (adc_oneshot_io_to_channel(c->set.gpio, &c->unit, &c->chan) != ESP_OK) {
         ESP_LOGE(TAG, "%s: el GPIO%d no tiene ADC", s_info[id].key, c->set.gpio);
         return false;
@@ -339,13 +391,13 @@ static bool pulse_setup(sensor_cfg_t *c, sensor_id_t id)
     return gpio_isr_handler_add(c->set.gpio, pulse_isr, p) == ESP_OK;
 }
 
-/* Pines que ya usa la placa (pantalla, tactil, audio, SD, USB, consola) */
-static bool gpio_reserved(int gpio)
+/* Los GPIO que salen a las fichas de la placa (Waveshare ESP32-P4 7B). Los demas los
+ * usa la placa (pantalla, tactil, audio, SD, WiFi) o no tienen donde soldarse. */
+static bool gpio_on_header(int gpio)
 {
-    static const int used[] = { 7, 8, 9, 10, 11, 12, 13, 24, 25, 26, 27, 32, 33, 37, 38,
-                                39, 40, 41, 42, 43, 44, 53 };
-    for (size_t i = 0; i < sizeof(used) / sizeof(used[0]); i++) {
-        if (used[i] == gpio) {
+    static const int8_t pins[] = { 2, 3, 4, 5, 28, 29, 30, 31, 34, 36, 46, 47, 48, 49, 51, 52 };
+    for (size_t i = 0; i < sizeof(pins); i++) {
+        if (pins[i] == gpio) {
             return true;
         }
     }
@@ -354,11 +406,63 @@ static bool gpio_reserved(int gpio)
 
 bool sensors_gpio_ok(int gpio, bool analog)
 {
-    if (gpio < 0 || gpio > 54 || gpio_reserved(gpio)) {
+    if (SENSOR_PIN_IS_ADS(gpio)) {
+        return analog;
+    }
+    if (!gpio_on_header(gpio)) {
         return false;
     }
-    /* ADC del P4: GPIO16-23 y GPIO49-54 */
+    /* ADC del P4: GPIO16-23 y GPIO49-54 (en las fichas: 49, 51 y 52) */
     return !analog || (gpio >= 16 && gpio <= 23) || (gpio >= 49 && gpio <= 54);
+}
+
+void sensors_pin_name(int pin, char *buf, int len)
+{
+    if (SENSOR_PIN_IS_ADS(pin)) {
+        snprintf(buf, len, "ADS1115 #%d A%d", SENSOR_PIN_ADS_CHIP(pin) + 1, SENSOR_PIN_ADS_CH(pin));
+    } else if (pin >= 0) {
+        snprintf(buf, len, "IO%d", pin);
+    } else {
+        snprintf(buf, len, "sin entrada");
+    }
+}
+
+const sensor_input_t *sensors_board_input(sensor_id_t id)
+{
+    return id < SENSOR_COUNT && s_inputs[id].name ? &s_inputs[id] : NULL;
+}
+
+void sensors_apply_board_input(sensor_id_t id, sensor_setup_t *s)
+{
+    const sensor_input_t *in = sensors_board_input(id);
+    if (!in) {
+        return;
+    }
+    s->gpio = in->pin;
+    switch (in->kind) {
+    case INPUT_KIND_5V:
+        s->divisor = DIVISOR_5V;
+        break;
+    case INPUT_KIND_NTC:
+        s->divisor = 1.0f;
+        s->pullup = NTC_PULLUP;
+        s->vpullup = NTC_VPULLUP;
+        break;
+    case INPUT_KIND_BATTERY:
+        s->divisor = DIVISOR_BATTERY;
+        break;
+    case INPUT_KIND_PULSE:
+        s->edge_rising = 0;    /* el optoacoplador tira a masa */
+        break;
+    }
+}
+
+bool sensors_uses_board_input(sensor_id_t id, const sensor_setup_t *s)
+{
+    sensor_setup_t ref = *s;
+    sensors_apply_board_input(id, &ref);
+    return ref.gpio == s->gpio && ref.divisor == s->divisor && ref.pullup == s->pullup &&
+           ref.vpullup == s->vpullup && ref.edge_rising == s->edge_rising;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -388,13 +492,27 @@ void sensors_default_setup(sensor_id_t id, sensor_setup_t *s)
     switch (id) {
     case SENSOR_WATER_TEMP: case SENSOR_OIL_TEMP: case SENSOR_IAT:
         s->type = TYPE_NTC_BOSCH;
-        s->divisor = 1.0f;     /* la NTC va directo al pin con pull-up a 3,3 V */
         s->filter = 0.05f;     /* las temperaturas cambian lento: mucho filtro */
         break;
     case SENSOR_BATTERY:
         s->type = TYPE_VOLTS;
-        s->divisor = 11;       /* divisor tipico: 100k + 10k */
         s->filter = 0.1f;
+        break;
+    case SENSOR_BOOST:
+        s->type = TYPE_MAP_3BAR;
+        break;
+    case SENSOR_OIL_PRESS: case SENSOR_FUEL_PRESS:
+        s->type = TYPE_PRESS_100PSI;
+        break;
+    case SENSOR_AFR:
+        s->type = TYPE_WIDEBAND_10_20;
+        break;
+    case SENSOR_EGT:
+        s->type = TYPE_EGT_5MV;
+        break;
+    case SENSOR_TPS:           /* potenciometro tipico: 0,5 V suelto, 4,5 V a fondo */
+        s->v1 = 0.5f; s->val1 = 0; s->v2 = 4.5f; s->val2 = 100;
+        s->filter = 0.5f;
         break;
     case SENSOR_RPM:
         s->pulses = 2;         /* 4 cilindros, 4 tiempos */
@@ -405,6 +523,7 @@ void sensors_default_setup(sensor_id_t id, sensor_setup_t *s)
     default:
         break;
     }
+    sensors_apply_board_input(id, s);
 }
 
 /* false = nunca se configuro (o la memoria tiene una version vieja) */
@@ -494,6 +613,46 @@ const char *sensors_type_label(int type)
     return type >= 0 && type < PRESET_COUNT ? s_presets[type].label : "?";
 }
 
+bool sensors_type_fits(sensor_id_t id, int type)
+{
+    if (type < 0 || type >= PRESET_COUNT) {
+        return false;
+    }
+    if (type == SENSOR_TYPE_LINEAL) {
+        return id != SENSOR_RPM && id != SENSOR_SPEED;   /* sirve para cualquier analogico */
+    }
+    const curve_preset_t *p = &s_presets[type];
+    bool temp = id == SENSOR_WATER_TEMP || id == SENSOR_OIL_TEMP || id == SENSOR_IAT;
+    if (p->kind != CURVE_LINEAR) {
+        return temp;                                    /* NTC */
+    }
+    const char *u = p->unit;
+    if (!strcasecmp(u, "kpa_abs")) return id == SENSOR_BOOST;
+    if (!strcasecmp(u, "psi") || !strcasecmp(u, "bar")) {
+        return id == SENSOR_OIL_PRESS || id == SENSOR_FUEL_PRESS || id == SENSOR_BOOST;
+    }
+    if (!strcasecmp(u, "afr")) return id == SENSOR_AFR;
+    if (!strcasecmp(u, "v")) return id == SENSOR_BATTERY;
+    if (!strcasecmp(u, "c")) return id == SENSOR_EGT;
+    return false;
+}
+
+const char *sensors_problem(sensor_id_t id)
+{
+    if (id >= SENSOR_COUNT) {
+        return NULL;
+    }
+    const sensor_cfg_t *c = &s_cfg[id];
+    if (c->src == SENSOR_SRC_OFF && (c->set.src == SENSOR_SRC_ANALOG || c->set.src == SENSOR_SRC_PULSE)) {
+        return "esa entrada no sirve para este sensor";
+    }
+    if (c->src == SENSOR_SRC_ANALOG && c->ads && !ads_present(c->ads_chip)) {
+        return c->ads_chip == 0 ? "no se encuentra el ADS1115 #1 (0x48)"
+                                : "no se encuentra el ADS1115 #2 (0x49)";
+    }
+    return NULL;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Tarea de lectura                                                           */
 /* ------------------------------------------------------------------------- */
@@ -529,6 +688,7 @@ static void sensors_task(void *arg)
     TickType_t wake = xTaskGetTickCount();
     TickType_t period = pdMS_TO_TICKS(LOOP_MS) ? pdMS_TO_TICKS(LOOP_MS) : 1;
     while (1) {
+        ads_poll();            /* trae lo que convirtieron los ADS1115 y arranca lo siguiente */
         float t = esp_timer_get_time() / 1e6f;
         for (int i = 0; i < SENSOR_COUNT; i++) {
             sensor_cfg_t *c = &s_cfg[i];
@@ -541,7 +701,10 @@ static void sensors_task(void *arg)
                 break;
             case SENSOR_SRC_ANALOG: {
                 float volts;
-                if (!analog_read_volts(c, &volts)) break;
+                if (!analog_read_volts(c, &volts)) {
+                    s_volts[i] = NAN;          /* sin lectura: el menu lo muestra */
+                    break;
+                }
                 s_volts[i] = volts;
                 float v = analog_curve(c, i, volts);
                 if (isnan(v)) break;           /* sensor desconectado: queda el ultimo valor */
@@ -587,7 +750,9 @@ void sensors_start(void)
             bool analog = c->src == SENSOR_SRC_ANALOG;
             bool ok = sensors_gpio_ok(c->set.gpio, analog);
             if (!ok) {
-                ESP_LOGE(TAG, "%s: el GPIO%d no sirve para esto", s_info[i].key, c->set.gpio);
+                char pin[24];
+                sensors_pin_name(c->set.gpio, pin, sizeof(pin));
+                ESP_LOGE(TAG, "%s: %s no sirve para esto", s_info[i].key, pin);
             } else {
                 ok = analog ? analog_setup(c, i) : pulse_setup(c, i);
             }
@@ -596,11 +761,14 @@ void sensors_start(void)
             }
         }
         if (c->src == SENSOR_SRC_ANALOG || c->src == SENSOR_SRC_PULSE) {
-            ESP_LOGI(TAG, "%-12s %s en GPIO%d", s_info[i].key, src_name(c->src), c->set.gpio);
+            char pin[24];
+            sensors_pin_name(c->set.gpio, pin, sizeof(pin));
+            ESP_LOGI(TAG, "%-12s %s en %s", s_info[i].key, src_name(c->src), pin);
         } else if (c->src != SENSOR_SRC_OFF) {
             ESP_LOGI(TAG, "%-12s %s", s_info[i].key, src_name(c->src));
         }
     }
+    ads_start();               /* solo busca los ADS1115 si algun sensor los usa */
     xTaskCreate(sensors_task, "sensors", 4096, NULL, 4, NULL);
 }
 

@@ -79,6 +79,11 @@ void ecu_get_config(ecu_config_t *out)
     if (c.mode > ECU_MODE_MEGASQUIRT) {
         c.mode = ECU_MODE_OFF;
     }
+    /* Sin elegir: los de la placa de sensores (ficha CAN) */
+    if (c.tx_gpio < 0 && c.rx_gpio < 0) {
+        c.tx_gpio = ECU_CAN_TX_DEFAULT;
+        c.rx_gpio = ECU_CAN_RX_DEFAULT;
+    }
     *out = c;
 }
 
