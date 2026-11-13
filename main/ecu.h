@@ -10,8 +10,9 @@
  *  - MegaSquirt (MS2/Extra 3.4+, MS3 1.4+, MicroSquirt): la ECU transmite sola
  *    ("CAN realtime data broadcasting"), solo hay que escuchar.
  *
- * Hace falta un transceptor CAN de 3,3 V (SN65HVD230 o similar) entre los pines
- * TX/RX del ESP32-P4 y CAN-H / CAN-L (en OBD: pines 6 y 14 del conector).
+ * Se usa el transceptor que ya trae la pantalla: CAN-H / CAN-L van a su ficha CAN
+ * (en OBD: pines 6 y 14 del conector). Tambien se puede usar un transceptor externo
+ * de 3,3 V (SN65HVD230) en dos pines libres.
  *
  * OBD-II: detecta sola la velocidad del bus (500 o 250 kbit/s) y si usa IDs de 11 o
  * 29 bits, pregunta que datos informa la ECU y despues los pide en ronda, con las RPM
@@ -20,9 +21,15 @@
  * se detectan solos.
  * Los valores van a los sensores que tienen fuente "ECU" (sensors_set_ecu). */
 
-/* Pines de la ficha CAN en la placa de sensores */
-#define ECU_CAN_TX_DEFAULT  46
-#define ECU_CAN_RX_DEFAULT  47
+/* La pantalla (Waveshare ESP32-P4 7B) ya trae un transceptor CAN, un TJA1051, en
+ * GPIO22 (TX) y GPIO21 (RX), con su ficha CANH / CANL. Asi lo usa Waveshare en sus
+ * ejemplos (14_twai_transmit y el firmware de fabrica). */
+#define ECU_CAN_TX_DEFAULT  22
+#define ECU_CAN_RX_DEFAULT  21
+
+/* true si esos pines sirven para el CAN: los de la pantalla, o dos pines libres de
+ * las fichas para un transceptor externo */
+bool ecu_pins_ok(int tx, int rx);
 
 typedef enum {
     ECU_MODE_OFF = 0,

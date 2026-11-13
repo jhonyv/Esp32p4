@@ -61,7 +61,7 @@ static const sensor_input_t s_inputs[SENSOR_COUNT] = {
 
 /* El circuito de cada tipo de entrada */
 #define DIVISOR_5V       1.5f    /* 10k arriba, 20k abajo: 5 V -> 3,33 V */
-#define DIVISOR_BATTERY  11.0f   /* 100k arriba, 10k abajo */
+#define DIVISOR_BATTERY  5.7f    /* 47k arriba, 10k abajo: lee hasta ~17 V */
 #define NTC_PULLUP       1000.0f /* 1k a 3,3 V: buena resolucion entre 60 y 130 C */
 #define NTC_VPULLUP      3.3f
 
